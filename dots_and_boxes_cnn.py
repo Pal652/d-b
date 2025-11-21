@@ -374,7 +374,7 @@ def detect_two_filled_components(table: Table):
             comps.append({'type':'open_loop', 'sequence': comp_nodes})
         else:
             # path: order nodes from endpoint (deg==1) if possible
-            endpoints = [n for n in comp_nodes if len(adj[n]) == 1]
+            endpoints = [n for n in comp_nodes if (len(adj[n]) == 1)]
             if endpoints:
                 if (filled_counts[endpoints[0]] == 3 or filled_counts[endpoints[1]] == 3): # poison chain with 3 filled
                     continue # broken shit
@@ -393,6 +393,8 @@ def detect_two_filled_components(table: Table):
                     if cur == start:
                         break
                 comps.append({'type':'open_chain', 'sequence': seq})
+            elif (filled_counts[comp_nodes[0]] == 3):
+                pass # single 3-edged box
             else:
                 comps.append({'type':'open_chain', 'sequence': comp_nodes})
 
@@ -891,26 +893,6 @@ def mcts_search(root_state:Table, model:nn.Module, device:torch.device,
     return best_mv
 
 # -------------------------
-# Domino chooser: evaluate both candidate moves with the value net and pick the better for current player
-# -------------------------
-def choose_between_domino_moves(table:Table, moves:List[Tuple[str,int,int]], model:nn.Module, device:torch.device):
-    best = None
-    best_val = -1e9
-    curr_is_p1 = table.FirstPlayer
-    for mv in moves:
-        if mv is None: continue
-        t_clone = table.clone()
-        t_clone.apply_move(mv)
-        inp = torch.from_numpy(encode_table(t_clone)).unsqueeze(0).to(device)
-        with torch.no_grad():
-            v = model(inp).item()
-        effective = v if curr_is_p1 else -v
-        if effective > best_val:
-            best_val = effective
-            best = mv
-    return best
-
-# -------------------------
 # Self-play with heuristics + domino handling + MCTS
 # -------------------------
 def self_play_episode(model:nn.Module, device:torch.device, N:int, mcts_sim:int, prefills:int, rng:random.Random):
@@ -922,25 +904,18 @@ def self_play_episode(model:nn.Module, device:torch.device, N:int, mcts_sim:int,
     while not t.game_over():
         states.append(encode_table(t)); was_first.append(t.FirstPlayer)
         forced = heuristic_forced_move(t)
-        if forced is None:
+        if isinstance(forced, dict) and 'domino' not in forced:
+            t.apply_move(forced); continue
+        else: # no forced
             mv = mcts_search(t, model, device, num_simulations=mcts_sim)
             if mv is None:
+                raise RuntimeError("MCTS failed to find a move")
                 mvs = t.legal_moves()
                 if not mvs: break
                 mv = rng.choice(mvs)
             t.apply_move(mv); continue
         # forced is either a move tuple, or {'domino': [mvA,mvB]}
-        if isinstance(forced, dict) and 'domino' in forced:
-            chosen = choose_between_domino_moves(t, forced['domino'], model, device)
-            if chosen is None:
-                # fallback random
-                mvs = t.legal_moves()
-                if not mvs: break
-                chosen = rng.choice(mvs)
-            t.apply_move(chosen); continue
-        else:
-            # normal forced single move
-            t.apply_move(forced); continue
+        
     return states, was_first, t.score, t.max_score()
 
 # -------------------------
@@ -1126,10 +1101,6 @@ class PygameUI:
             # compute highlights once per loop/turn
             # suicidal edges (red)
 
-            if table.FirstPlayer == human_is_p1:
-                if hasattr(self, "_abstract_root_moves"):
-                    self._abstract_root_moves = []
-
             self._suicide_edges = get_suicidal_moves(table)
 
             # collapsed open components -> orange edges
@@ -1144,14 +1115,9 @@ class PygameUI:
             # compute forced/domino highlights as before
             forced = heuristic_forced_move(table)
             highlight = []
-            domino_mode = None
-            if isinstance(forced, dict) and 'domino' in forced:
-                domino_mode = forced['domino']
-                if human_is_p1 == table.FirstPlayer:
-                    highlight = domino_mode
-            elif isinstance(forced, tuple):
-                if human_is_p1 == table.FirstPlayer:
-                    highlight = [forced]
+            if human_is_p1 == table.FirstPlayer:
+                if isinstance(forced, dict) and 'domino' in forced: highlight = forced['domino']
+                elif isinstance(forced, tuple):                     highlight = [forced]
 
             self.draw_board(table, highlight_moves=highlight)
 
@@ -1167,39 +1133,26 @@ class PygameUI:
                     mv = self.mouse_to_move(mx,my,table)
                     if mv:
                         # if domino_mode, only allow those two
-                        if domino_mode and mv not in domino_mode:
-                            continue
+                        if highlight and mv not in highlight: continue
+
                         # only allow human to move when it's their turn
-                        if table.FirstPlayer == human_is_p1:
-                            table.apply_move(mv)
+                        if table.FirstPlayer == human_is_p1: table.apply_move(mv)
 
             # AI's turn
             if table.FirstPlayer != human_is_p1:
                 forced = heuristic_forced_move(table)
-                if isinstance(forced, dict) and 'domino' in forced:
-                    chosen = choose_between_domino_moves(table, forced['domino'], self.model, self.device)
-                    if chosen is None:
-                        moves = table.legal_moves()
-                        if moves: table.apply_move(random.choice(moves))
-                    else:
-                        table.apply_move(chosen)
-                elif isinstance(forced, tuple):
+                if isinstance(forced, dict) and 'domino' not in forced: 
                     table.apply_move(forced)
                 else:
                     mv = mcts_search(table, self.model, self.device, num_simulations=self.mcts_sim)
                     # Save abstract root moves so UI can highlight them on human turns (?)
-                    self._abstract_root_moves = []
                     root_moves = generate_root_moves_with_collapse(table)
-                    self._abstract_root_moves = [mv for mv in root_moves if isinstance(mv, tuple) and mv[0] in ('chain_take','loop_take')]
-                    
-                    if mv is None:
-                        moves = table.legal_moves()
-                        if moves: table.apply_move(random.choice(moves))
-                    elif isinstance(mv, tuple) and mv[0] in ('chain_take','open_take','loop_take'):
-                        print(mv)
+
+                    if isinstance(mv, tuple) and mv[0] == 'open_take':
+                        print("enemy move:", mv)
                         execute_abstract_move(table, mv)
                     else:
-                        print(mv)
+                        print("enemy move:", mv)
                         table.apply_move(mv)
             clock.tick(30)
 
@@ -1209,14 +1162,7 @@ class PygameUI:
         while not t.game_over():
             if render: self.draw_board(t)
             forced = heuristic_forced_move(t)
-            if isinstance(forced, dict) and 'domino' in forced:
-                chosen = choose_between_domino_moves(t, forced['domino'], self.model, self.device)
-                if chosen is None:
-                    mvs = t.legal_moves()
-                    if not mvs: break
-                    chosen = random.choice(mvs)
-                t.apply_move(chosen); continue
-            elif isinstance(forced, tuple):
+            if isinstance(forced, dict) and 'domino' not in forced:
                 t.apply_move(forced); continue
             mv = mcts_search(t, self.model, self.device, num_simulations=self.mcts_sim)
             if mv is None:
@@ -1251,13 +1197,9 @@ class PygameUI:
             # forced moves (domino or single)
             forced = heuristic_forced_move(table)
             highlight = []
-            domino_mode = None
 
-            if isinstance(forced, dict) and 'domino' in forced:
-                domino_mode = forced['domino']
-                highlight = domino_mode[:]       # highlight 2 moves
-            elif isinstance(forced, tuple):
-                highlight = [forced]
+            if isinstance(forced, dict) and 'domino' in forced: highlight = forced['domino'][:] # highlight 2 moves 
+            elif isinstance(forced, tuple):                     highlight = [forced]            # highlight 1 move
 
             # draw
             self.draw_board(table, highlight_moves=highlight)
@@ -1278,8 +1220,7 @@ class PygameUI:
 
                     if mv:
                         # if domino, only allow the two domino moves
-                        if domino_mode and mv not in domino_mode:
-                            continue
+                        if highlight and mv not in highlight: continue
 
                         # forced single move
                         if isinstance(forced, tuple) and mv != forced:
