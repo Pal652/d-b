@@ -466,7 +466,9 @@ def generate_root_moves_with_collapse(state: Table):
     # add abstract collapsed actions
     use_moves.extend(collapsed_actions)
 
-    if not use_moves: raise Exception()
+    if not use_moves:
+        return []
+        #raise Exception()
 
     # attach rep map to the state? No, return rep_map too via attribute on function-level (global-like)
     # But better: store rep_map in a module-level dict so execute_abstract_move can look it up.
@@ -897,23 +899,21 @@ def mcts_search(root_state:Table, model:nn.Module, device:torch.device,
 # -------------------------
 def self_play_episode(model:nn.Module, device:torch.device, N:int, mcts_sim:int, prefills:int, rng:random.Random):
     t = Table(N)
+    # rng games first
     for _ in range(prefills):
         if t.game_over(): break
         mv = rng.choice(t.legal_moves()); t.apply_move(mv)
-    states=[]; was_first=[]
+    
+    states=[]
+    was_first=[]
     while not t.game_over():
-        states.append(encode_table(t)); was_first.append(t.FirstPlayer)
+        states.append(encode_table(t))
+        was_first.append(t.FirstPlayer)
+
         forced = heuristic_forced_move(t)
-        if isinstance(forced, dict) and 'domino' not in forced:
-            t.apply_move(forced); continue
-        else: # no forced
-            mv = mcts_search(t, model, device, num_simulations=mcts_sim)
-            if mv is None:
-                raise RuntimeError("MCTS failed to find a move")
-                mvs = t.legal_moves()
-                if not mvs: break
-                mv = rng.choice(mvs)
-            t.apply_move(mv); continue
+        if isinstance(forced, tuple): t.apply_move(forced)
+        else: mcts_search(t, model, device, num_simulations=mcts_sim)
+
         # forced is either a move tuple, or {'domino': [mvA,mvB]}
         
     return states, was_first, t.score, t.max_score()
@@ -997,7 +997,7 @@ class Trainer:
 
 
 class PygameUI:
-    def __init__(self, trainer:Trainer, board_size=4, mcts_sim=80, heuristic_first=True):
+    def __init__(self, trainer:Trainer, board_size=4, mcts_sim=80, heuristic_first=True, heuristic_help=True):
         pygame.init()
         self.trainer = trainer
         self.device = trainer.device
@@ -1005,6 +1005,7 @@ class PygameUI:
         self.board_size = board_size
         self.mcts_sim = mcts_sim
         self.heuristic_first = heuristic_first
+        self.heuristic_help = heuristic_help
         self.cell = 60
         self.margin = 20
         self.width = self.margin*2 + (self.cell * board_size)
@@ -1046,7 +1047,9 @@ class PygameUI:
                 if table.horizontal[y,x]==1:
                     pygame.draw.line(self.screen,(200,200,80),(px,py),(px+cell,py),6)
                 else:
-                    if mv in suicide_edges:
+                    if (not self.heuristic_help):
+                        pygame.draw.line(self.screen,(60,60,60),(px,py),(px+cell,py),4)
+                    elif mv in suicide_edges:
                         pygame.draw.line(self.screen, (220,50,50), (px,py),(px+cell,py),6)  # red
                     elif mv in collapsed_edges:
                         pygame.draw.line(self.screen, (255,140,0), (px,py),(px+cell,py),6)  # orange
@@ -1065,7 +1068,9 @@ class PygameUI:
                 if table.vertical[y,x]==1:
                     pygame.draw.line(self.screen,(80,200,200),(px,py),(px,py+cell),6)
                 else:
-                    if mv in suicide_edges:
+                    if (not self.heuristic_help):
+                        pygame.draw.line(self.screen,(60,60,60),(px,py),(px,py+cell),4)
+                    elif mv in suicide_edges:
                         pygame.draw.line(self.screen, (220,50,50),(px,py),(px,py+cell),6)
                     elif mv in collapsed_edges:
                         pygame.draw.line(self.screen, (255,140,0),(px,py),(px,py+cell),6)
@@ -1133,7 +1138,7 @@ class PygameUI:
                     mv = self.mouse_to_move(mx,my,table)
                     if mv:
                         # if domino_mode, only allow those two
-                        if highlight and mv not in highlight: continue
+                        if self.heuristic_help and highlight and mv not in highlight: continue
 
                         # only allow human to move when it's their turn
                         if table.FirstPlayer == human_is_p1: table.apply_move(mv)
@@ -1141,7 +1146,7 @@ class PygameUI:
             # AI's turn
             if table.FirstPlayer != human_is_p1:
                 forced = heuristic_forced_move(table)
-                if isinstance(forced, dict) and 'domino' not in forced: 
+                if isinstance(forced, tuple): 
                     table.apply_move(forced)
                 else:
                     mv = mcts_search(table, self.model, self.device, num_simulations=self.mcts_sim)
@@ -1158,20 +1163,16 @@ class PygameUI:
 
     def play_ai_vs_ai(self, render=True, delay=0.2):
         t = Table(self.board_size, UI=True)
-        clock = pygame.time.Clock()
         while not t.game_over():
             if render: self.draw_board(t)
+
             forced = heuristic_forced_move(t)
-            if isinstance(forced, dict) and 'domino' not in forced:
-                t.apply_move(forced); continue
+            if isinstance(forced, tuple): t.apply_move(forced); continue
+
             mv = mcts_search(t, self.model, self.device, num_simulations=self.mcts_sim)
-            if mv is None:
-                mvs = t.legal_moves()
-                if not mvs: break
-                mv = random.choice(mvs)
             t.apply_move(mv)
-            if render:
-                pygame.time.wait(int(delay*1000))
+
+            if render: pygame.time.wait(int(delay*1000))
         print("AI vs AI finished. score:", t.score)
         if render: pygame.time.wait(2000)
 
@@ -1219,14 +1220,9 @@ class PygameUI:
                     mv = self.mouse_to_move(mx, my, table)
 
                     if mv:
-                        # if domino, only allow the two domino moves
-                        if highlight and mv not in highlight: continue
+                        # require forced/domino mode
+                        if self.heuristic_help and highlight and mv not in highlight: continue
 
-                        # forced single move
-                        if isinstance(forced, tuple) and mv != forced:
-                            continue
-
-                        # apply move
                         table.apply_move(mv)
 
             clock.tick(30)
@@ -1255,6 +1251,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('mode', choices=['play','train','selfplay','pvp'], help='Mode')
     parser.add_argument('--board', type=int, default=4)
+    parser.add_argument('--guide', type=int, default=1) # help player with heuristics
     parser.add_argument('--device', default='cpu')
     parser.add_argument('--load', default=None)
     parser.add_argument('--mcts', type=int, default=80)
@@ -1269,13 +1266,13 @@ def main():
         trainer.train_iterations(total_iters=args.iters, episodes_per_iter=4, mcts_sim=40,
                                  prefill_start=0, prefill_end=args.board*args.board, batch_size=128)
     elif args.mode == 'play':
-        ui = PygameUI(trainer, board_size=args.board, mcts_sim=args.mcts)
+        ui = PygameUI(trainer, board_size=args.board, mcts_sim=args.mcts, heuristic_help=(args.guide==1))
         ui.play_human_vs_ai()
     elif args.mode == 'selfplay':
         ui = PygameUI(trainer, board_size=args.board, mcts_sim=args.mcts)
         ui.play_ai_vs_ai(render=True)
     elif args.mode == 'pvp':       # ✔ NEW MODE — Human vs Human
-        ui = PygameUI(trainer, board_size=args.board, mcts_sim=args.mcts)
+        ui = PygameUI(trainer, board_size=args.board, mcts_sim=args.mcts, heuristic_help=(args.guide==1))
         ui.play_human_vs_human()
 
 if __name__ == '__main__':
