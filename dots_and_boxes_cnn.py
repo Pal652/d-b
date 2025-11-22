@@ -649,6 +649,9 @@ def execute_abstract_move(state: Table, abstract_move):
     bx = abstract_move[1]
     by = abstract_move[2]
 
+    if kind == 'h' or kind == 'v':
+        return state.apply_move(abstract_move)
+    
     if kind == 'open_take':
         # use rep map prepared by generate_root_moves_with_collapse
         rep_map = getattr(generate_root_moves_with_collapse, "_rep_map", {})
@@ -759,145 +762,207 @@ class BatchEvaluator:
         self.pending.clear()
 
 
+import math, numpy as np
+from typing import Dict, Tuple, List
+import torch
+import torch.nn as nn
+
+
 class MCTSNode:
-    def __init__(self,state:Table):
+    def __init__(self, state:Table):
         self.state = state
-        self.is_expanded=False
-        self.children:Dict[Tuple[str,int,int],'MCTSNode'] = {}
-        self.priors:Dict[Tuple[str,int,int],float] = {}
-        self.visit_count:Dict[Tuple[str,int,int],int] = {}
-        self.value_sum:Dict[Tuple[str,int,int],float] = {}
-        self.total_visits=0
+        self.is_expanded = False
 
-def mcts_search(root_state:Table, model:nn.Module, device:torch.device,
-                num_simulations:int=50, c_puct:float=1.0, dirichlet_alpha:float=0.3, dir_noise_eps:float=0.25,
-                allowed_moves=None):
-    """
-    If allowed_moves is provided (list of moves) only those moves are used at the root expansion.
-    This version uses:
-      - suicidal-move filtering
-      - chain/loop collapse at the root to reduce branching
-      - supports abstract moves ('chain_take', 'loop_take') as root children
-    """
-    root = MCTSNode(root_state.clone())
-    batcher = BatchEvaluator(model, device, batch_size=32)
+        # child move → node
+        self.children: Dict[Tuple[str,int,int], "MCTSNode"] = {}
+
+        # P, N, W for each move
+        self.priors: Dict[Tuple[str,int,int], float] = {}
+        self.visit_count: Dict[Tuple[str,int,int], int] = {}
+        self.value_sum: Dict[Tuple[str,int,int], float] = {}
+
+        # N(s)
+        self.total_visits = 0
 
 
-    def expand(node:MCTSNode):
-        # For root: use collapsed, filtered moves
-        if node is root:
+class MCTS:
+    def __init__(self, model:nn.Module, device,
+                 num_simulations:int = 50, c_puct:float = 1.0,
+                 dirichlet_alpha:float = 0.3, dir_noise_eps:float = 0.25):
+
+        self.model = model
+        self.device = device
+        self.num_simulations = num_simulations
+        self.c_puct = c_puct
+        self.dirichlet_alpha = dirichlet_alpha
+        self.dir_noise_eps = dir_noise_eps
+
+        self.batcher = BatchEvaluator(model, device, batch_size=32)
+
+
+    # ----------------------------------------------------------
+    # Utility: expand a node
+    # ----------------------------------------------------------
+    def expand(self, node:MCTSNode, root:bool, allowed_moves):
+        if root:
             if allowed_moves is not None:
-                # respect allowed_moves filter if provided (explicit list)
                 moves = [mv for mv in node.state.legal_moves() if mv in allowed_moves]
-                # If allowed moves includes abstract moves (unlikely), we won't collapse further
             else:
                 moves = generate_root_moves_with_collapse(node.state)
         else:
-            # For non-root nodes we expand ALL legal moves normally (no collapse),
-            # but still filter suicidal moves if any safe moves exist.
             legal = node.state.legal_moves()
             safe = [mv for mv in legal if not is_suicidal_move(node.state, mv)]
             moves = safe if safe else legal
 
         if not moves:
-            node.is_expanded=True
+            node.is_expanded = True
             return
-        p = 1.0/len(moves)
+
+        p = 1.0 / len(moves)
         for mv in moves:
             node.priors[mv] = p
             node.visit_count[mv] = 0
             node.value_sum[mv] = 0.0
+
         node.is_expanded = True
 
-    def evaluate_leaf(node: MCTSNode):
-        # leaf eval is delayed — return None and queue
-        queued = batcher.queue(node, node.state)
-        if not queued:
-            batcher.flush()
-        return None
 
-    def add_root_noise(node:MCTSNode):
+    # ----------------------------------------------------------
+    # Utility: add Dirichlet noise at root
+    # ----------------------------------------------------------
+    def add_root_noise(self, node:MCTSNode):
         moves = list(node.priors.keys())
-        if not moves: return
-        noise = np.random.dirichlet([dirichlet_alpha]*len(moves))
-        for i,mv in enumerate(moves):
-            node.priors[mv] = node.priors[mv]*(1-dir_noise_eps) + noise[i]*dir_noise_eps
+        if not moves: 
+            return
 
-    expand(root); add_root_noise(root)
+        noise = np.random.dirichlet([self.dirichlet_alpha]*len(moves))
+        for mv, eps in zip(moves, noise):
+            old = node.priors[mv]
+            node.priors[mv] = old*(1-self.dir_noise_eps) + eps*self.dir_noise_eps
 
-    for _ in range(num_simulations):
-        node = root; path = []
-        # SELECTION
-        while node.is_expanded and node.priors:
-            best=-1e9; best_mv=None
-            sqrt_parent = math.sqrt(max(1,node.total_visits))
-            for mv,P in node.priors.items():
-                N = node.visit_count[mv]; Q = (node.value_sum[mv]/N) if N>0 else 0.0
-                u = Q + c_puct*P*(sqrt_parent/(1+N))
-                if u>best:
-                    best=u; best_mv=mv
-            if best_mv is None:
-                break
-            path.append((node,best_mv))
-            # CHILD CREATION:
-            if best_mv not in node.children:
-                # create child by applying the move (support abstract moves)
-                child_state = node.state.clone()
-                if isinstance(best_mv, tuple) and best_mv and best_mv[0] in ('chain_take','loop_take','open_take'):
-                    # execute the abstract move (devour + forced single moves)
-                    execute_abstract_move(child_state, best_mv)
+
+    # ----------------------------------------------------------
+    # Utility: PUCT move selection
+    # ----------------------------------------------------------
+    def select_move(self, node:MCTSNode):
+        best = -1e9
+        best_mv = None
+
+        sqrt_parent = math.sqrt(max(1, node.total_visits))
+
+        for mv, P in node.priors.items():
+            N = node.visit_count[mv]
+            Q = (node.value_sum[mv] / N) if N > 0 else 0.0
+            u = Q + self.c_puct * P * sqrt_parent / (1 + N)
+            if u > best:
+                best = u
+                best_mv = mv
+
+        return best_mv
+
+
+    # ----------------------------------------------------------
+    # Utility: NN evaluation for leaf
+    # ----------------------------------------------------------
+    def evaluate_leaf(self, node:MCTSNode):
+        queued = self.batcher.queue(node, node.state)
+        if not queued:
+            self.batcher.flush()
+
+
+    # ----------------------------------------------------------
+    # Perform one root-level MCTS search
+    # ----------------------------------------------------------
+    def search(self, root_state:Table, allowed_moves=None):
+        root = MCTSNode(root_state.clone())
+
+        # initial expansion + noise
+        self.expand(root, root=True, allowed_moves=allowed_moves)
+        self.add_root_noise(root)
+
+        for _ in range(self.num_simulations):
+
+            node = root
+            path = []
+
+            # -------------------------
+            # SELECTION
+            # -------------------------
+            while node.is_expanded and node.priors:
+                mv = self.select_move(node)
+                if mv is None:
+                    break
+
+                path.append((node, mv))
+
+                # create child if missing
+                if mv not in node.children:
+                    child_state = node.state.clone()
+                    if isinstance(mv, tuple) and mv[0] in ('chain_take','loop_take','open_take'):
+                        execute_abstract_move(child_state, mv)
+                    else:
+                        child_state.apply_move(mv)
+
+                    child = MCTSNode(child_state)
+                    node.children[mv] = child
+                    node = child
+                    break
                 else:
-                    child_state.apply_move(best_mv)
-                child = MCTSNode(child_state)
-                node.children[best_mv] = child
-                node = child
-                break
-            else:
-                node = node.children[best_mv]
+                    node = node.children[mv]
 
-        # EXPAND / EVALUATE
-        if not node.is_expanded:
-            expand(node)
-            _ = evaluate_leaf(node)
-            continue  # value will be filled after batch flush
-
-        else:
-            if node.state.game_over():
-                final = node.state.score
-                v_abs = final / max(1, node.state.max_score())
-                v = v_abs if node.state.FirstPlayer else -v_abs
-            else:
-                _ = evaluate_leaf(node)
+            # -------------------------
+            # EXPAND / EVALUATE OR TERMINAL
+            # -------------------------
+            if not node.is_expanded:
+                self.expand(node, root=False, allowed_moves=None)
+                self.evaluate_leaf(node)
                 continue
 
+            if node.state.game_over():
+                final_score = node.state.score
+                v_abs = final_score / max(1, node.state.max_score())
+                v = v_abs if node.state.FirstPlayer else -v_abs
+            else:
+                self.evaluate_leaf(node)
+                continue
 
-        # BACKPROPAGATE
-        # After finishing this simulation step, try flushing any batch
-        batcher.flush()
+            # -------------------------
+            # BACKPROP
+            # -------------------------
+            self.batcher.flush()
 
-        # Any node whose _pending_value is set can now be backpropagated:
-        if hasattr(node, "_pending_value"):
-            v = node._pending_value
-            del node._pending_value
-            to_prop = v
-            for parent, action in reversed(path):
-                parent.total_visits += 1
-                parent.visit_count[action] += 1
-                parent.value_sum[action] += to_prop
-                to_prop = -to_prop
+            if hasattr(node, "_pending_value"):
+                v = node._pending_value
+                del node._pending_value
 
-    # choose best move from root (highest visit count, tie-breaker avg value)
-    best_mv=None; best_vis=-1; best_avg=-1e9
-    for mv in root.priors.keys():
-        N = root.visit_count[mv]; avg = (root.value_sum[mv]/N) if N>0 else 0.0
-        if N>best_vis or (N==best_vis and avg>best_avg):
-            best_vis=N; best_avg=avg; best_mv=mv
-    return best_mv
+                for parent, action in reversed(path):
+                    parent.total_visits += 1
+                    parent.visit_count[action] += 1
+                    parent.value_sum[action] += v
+                    v = -v
+
+        # ------------------------------------------
+        # PICK BEST ROOT MOVE
+        # ------------------------------------------
+        best_mv = None
+        best_vis = -1
+        best_avg = -1e9
+
+        for mv in root.priors.keys():
+            N = root.visit_count[mv]
+            avg = (root.value_sum[mv]/N) if N > 0 else 0.0
+
+            if N > best_vis or (N == best_vis and avg > best_avg):
+                best_vis = N
+                best_avg = avg
+                best_mv = mv
+
+        return best_mv
 
 # -------------------------
 # Self-play with heuristics + domino handling + MCTS
 # -------------------------
-def self_play_episode(model:nn.Module, device:torch.device, N:int, mcts_sim:int, prefills:int, rng:random.Random):
+def self_play_episode(mcts:MCTS, N:int, prefills:int, rng:random.Random):
     t = Table(N)
     # rng games first
     for _ in range(prefills):
@@ -912,22 +977,29 @@ def self_play_episode(model:nn.Module, device:torch.device, N:int, mcts_sim:int,
 
         forced = heuristic_forced_move(t)
         if isinstance(forced, tuple): t.apply_move(forced)
-        else: mcts_search(t, model, device, num_simulations=mcts_sim)
+        else: execute_abstract_move(t, (mcts.search(t)))
 
         # forced is either a move tuple, or {'domino': [mvA,mvB]}
-        
+    
+    print(t.score)
     return states, was_first, t.score, t.max_score()
 
 # -------------------------
 # Trainer (save/load)
 # -------------------------
 class Trainer:
-    def __init__(self, board_size=4, device='cpu', lr=2e-4, replay_capacity=50000):
+    def __init__(self, board_size=4, mcts_num_sim=50, device='cpu', lr=2e-4, replay_capacity=50000):
         self.device = torch.device(device)
         self.board_size = board_size
         self.model = DotsValueNet(board_size).to(self.device)
         self.optimizer = optim.Adam(self.model.parameters(), lr=lr)
         self.replay = ReplayBuffer(replay_capacity)
+
+        self.mcts = MCTS(
+            model=self.model,
+            device=self.device,
+            num_simulations=mcts_num_sim,  # default, overridden during train_iterations
+        )
 
     def save(self, path):
         path = os.path.join(GetPath(), "models", path)
@@ -945,7 +1017,7 @@ class Trainer:
                 pass
         print(f"Loaded model from {path}")
 
-    def train_iterations(self, total_iters=1000, episodes_per_iter=4, mcts_sim=50,
+    def train_iterations(self, total_iters=1000, episodes_per_iter=4,
                          prefill_start=0, prefill_end=12, batch_size=128, seed=42, log_every=25):
         rng = random.Random(seed); np.random.seed(seed); torch.manual_seed(seed)
         # bootstrap replay
@@ -969,7 +1041,7 @@ class Trainer:
             frac = it/total_iters
             prefills = int(prefill_start + frac*(prefill_end-prefill_start))
             for _ in range(episodes_per_iter):
-                states, was_first, final_diff, maxscore = self_play_episode(self.model, self.device, self.board_size, mcts_sim, prefills, rng)
+                states, was_first, final_diff, maxscore = self_play_episode(self.mcts, self.board_size, prefills, rng)
                 if maxscore<=0: continue
                 for s,w in zip(states,was_first):
                     target = (final_diff/maxscore) if w else (-final_diff/maxscore)
@@ -1000,10 +1072,10 @@ class PygameUI:
     def __init__(self, trainer:Trainer, board_size=4, mcts_sim=80, heuristic_first=True, heuristic_help=True):
         pygame.init()
         self.trainer = trainer
-        self.device = trainer.device
-        self.model = trainer.model
+        #self.device = trainer.device
+        #self.model = trainer.model
         self.board_size = board_size
-        self.mcts_sim = mcts_sim
+        #self.mcts_sim = mcts_sim
         self.heuristic_first = heuristic_first
         self.heuristic_help = heuristic_help
         self.cell = 60
@@ -1149,16 +1221,13 @@ class PygameUI:
                 if isinstance(forced, tuple): 
                     table.apply_move(forced)
                 else:
-                    mv = mcts_search(table, self.model, self.device, num_simulations=self.mcts_sim)
+                    mv = self.trainer.mcts.search(table)
                     # Save abstract root moves so UI can highlight them on human turns (?)
                     root_moves = generate_root_moves_with_collapse(table)
 
-                    if isinstance(mv, tuple) and mv[0] == 'open_take':
-                        print("enemy move:", mv)
-                        execute_abstract_move(table, mv)
-                    else:
-                        print("enemy move:", mv)
-                        table.apply_move(mv)
+                    print("enemy move:", mv)
+                    execute_abstract_move(table, mv)
+                        
             clock.tick(30)
 
     def play_ai_vs_ai(self, render=True, delay=0.2):
@@ -1169,8 +1238,9 @@ class PygameUI:
             forced = heuristic_forced_move(t)
             if isinstance(forced, tuple): t.apply_move(forced); continue
 
-            mv = mcts_search(t, self.model, self.device, num_simulations=self.mcts_sim)
-            t.apply_move(mv)
+            mv = self.trainer.mcts.search(t)
+            print(mv)
+            execute_abstract_move(t, mv)
 
             if render: pygame.time.wait(int(delay*1000))
         print("AI vs AI finished. score:", t.score)
@@ -1258,13 +1328,18 @@ def main():
     parser.add_argument('--iters', type=int, default=800)
     args = parser.parse_args()
 
-    trainer = Trainer(board_size=args.board, device=args.device)
+    trainer = Trainer(board_size=args.board, mcts_num_sim=args.mcts, device=args.device)
     if args.load:
         trainer.load(args.load)
 
     if args.mode == 'train':
-        trainer.train_iterations(total_iters=args.iters, episodes_per_iter=4, mcts_sim=40,
+        trainer.train_iterations(total_iters=args.iters, episodes_per_iter=4,
                                  prefill_start=0, prefill_end=args.board*args.board, batch_size=128)
+
+    if args.mode == 'play':
+        ui = PygameUI(trainer, board_size=args.board, mcts_sim=args.mcts, heuristic_help=(args.guide==1))
+        ui.play_human_vs_ai()
+
     elif args.mode == 'play':
         ui = PygameUI(trainer, board_size=args.board, mcts_sim=args.mcts, heuristic_help=(args.guide==1))
         ui.play_human_vs_ai()
