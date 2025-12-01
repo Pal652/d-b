@@ -878,7 +878,7 @@ class MCTS:
     # ----------------------------------------------------------
     # Perform one root-level MCTS search
     # ----------------------------------------------------------
-    def search(self, root_state:Table, allowed_moves=None):
+    def search(self, root_state:Table, allowed_moves):
         root = MCTSNode(root_state.clone())
 
         # initial expansion + noise
@@ -983,8 +983,10 @@ def self_play_episode(mcts:MCTS, N:int, prefills:int, rng:random.Random):
         current_scores.append(t.score)
 
         forced = heuristic_forced_move(t)
+        allowed_moves = None
         if isinstance(forced, tuple): t.apply_move(forced)
-        else: execute_abstract_move(t, (mcts.search(t)))
+        if isinstance(forced, dict) and 'domino' in forced: allowed_moves = forced['domino']
+        else: execute_abstract_move(t, (mcts.search(t, allowed_moves)))
 
         # forced is either a move tuple, or {'domino': [mvA,mvB]}
     
@@ -1232,7 +1234,7 @@ class PygameUI:
                     allowed_moves = None
                     if isinstance(forced, dict) and 'domino' in forced:
                         allowed_moves = forced['domino']
-                        print("allowed moves:", allowed_moves)
+                        #print("allowed moves:", allowed_moves)
                     mv = self.trainer.mcts.search(table, allowed_moves=allowed_moves)
                     # Save abstract root moves so UI can highlight them on human turns (?)
                     root_moves = generate_root_moves_with_collapse(table)
@@ -1250,7 +1252,11 @@ class PygameUI:
             forced = heuristic_forced_move(t)
             if isinstance(forced, tuple): t.apply_move(forced); continue
 
-            mv = self.trainer.mcts.search(t)
+            #if isinstance()
+            allowed_moves = None
+            if isinstance(forced, dict) and 'domino' in forced: allowed_moves = forced['domino']
+
+            mv = self.trainer.mcts.search(t, allowed_moves)
             print(mv)
             execute_abstract_move(t, mv)
 
