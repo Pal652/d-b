@@ -437,7 +437,8 @@ def generate_root_moves_with_collapse(state: Table):
     legal = state.legal_moves()
     # Step 1: safe moves
     safe_moves = [mv for mv in legal if not is_suicidal_move(state, mv)]
-    use_moves = safe_moves if safe_moves else legal[:] # if all unsafe, use all
+    have_safe = bool(safe_moves)
+    use_moves = safe_moves if have_safe else legal[:] # if all unsafe, use all
 
     # Step 2: detect open (two-filled) components and prepare collapse
     collapse_candidates = detect_two_filled_components(state)
@@ -451,6 +452,9 @@ def generate_root_moves_with_collapse(state: Table):
         seq = c['sequence']
         bx0, by0 = seq[0]
         # collect all free edges inside this component
+
+        if (have_safe and len(seq) > 2): # do not add open moves for longchains if not nessary
+            continue
         
         # choose good edge in this component
         e0 = box_empty_edges(state, bx0, by0)[0]
@@ -575,6 +579,7 @@ def heuristic_forced_move(table: Table):
         return {'domino': [dev, dec]}
 
     return None
+
 
 
 # -------------------------
@@ -806,7 +811,7 @@ class MCTS:
     def expand(self, node:MCTSNode, root:bool, allowed_moves):
         if root:
             if allowed_moves is not None:
-                moves = [mv for mv in node.state.legal_moves() if mv in allowed_moves]
+                moves = [mv for mv in node.state.legal_moves() if mv in allowed_moves] # domino only care about thoose 2 moves 
             else:
                 moves = generate_root_moves_with_collapse(node.state)
         else:
@@ -898,7 +903,7 @@ class MCTS:
                 # create child if missing
                 if mv not in node.children:
                     child_state = node.state.clone()
-                    if isinstance(mv, tuple) and mv[0] in ('chain_take','loop_take','open_take'):
+                    if isinstance(mv, tuple) and mv[0] in ('open_take'):
                         execute_abstract_move(child_state, mv)
                     else:
                         child_state.apply_move(mv)
@@ -971,9 +976,11 @@ def self_play_episode(mcts:MCTS, N:int, prefills:int, rng:random.Random):
     
     states=[]
     was_first=[]
+    current_scores = []
     while not t.game_over():
         states.append(encode_table(t))
         was_first.append(t.FirstPlayer)
+        current_scores.append(t.score)
 
         forced = heuristic_forced_move(t)
         if isinstance(forced, tuple): t.apply_move(forced)
@@ -982,7 +989,7 @@ def self_play_episode(mcts:MCTS, N:int, prefills:int, rng:random.Random):
         # forced is either a move tuple, or {'domino': [mvA,mvB]}
     
     print(t.score)
-    return states, was_first, t.score, t.max_score()
+    return states, was_first, current_scores, t.score, t.max_score()
 
 # -------------------------
 # Trainer (save/load)
@@ -1041,10 +1048,11 @@ class Trainer:
             frac = it/total_iters
             prefills = int(prefill_start + frac*(prefill_end-prefill_start))
             for _ in range(episodes_per_iter):
-                states, was_first, final_diff, maxscore = self_play_episode(self.mcts, self.board_size, prefills, rng)
+                states, was_first, current_scores, final_diff, maxscore = self_play_episode(self.mcts, self.board_size, prefills, rng)
                 if maxscore<=0: continue
-                for s,w in zip(states,was_first):
-                    target = (final_diff/maxscore) if w else (-final_diff/maxscore)
+                for s,w,c in zip(states,was_first,current_scores):
+                    target = (final_diff-c/maxscore)
+                    if not w: target *= -1
                     self.replay.push(s,target)
             # train steps
             if len(self.replay)>=8:
@@ -1221,7 +1229,11 @@ class PygameUI:
                 if isinstance(forced, tuple): 
                     table.apply_move(forced)
                 else:
-                    mv = self.trainer.mcts.search(table)
+                    allowed_moves = None
+                    if isinstance(forced, dict) and 'domino' in forced:
+                        allowed_moves = forced['domino']
+                        print("allowed moves:", allowed_moves)
+                    mv = self.trainer.mcts.search(table, allowed_moves=allowed_moves)
                     # Save abstract root moves so UI can highlight them on human turns (?)
                     root_moves = generate_root_moves_with_collapse(table)
 
@@ -1332,15 +1344,14 @@ def main():
     if args.load:
         trainer.load(args.load)
 
+    #debug
+    #trainer.train_iterations(total_iters=args.iters, episodes_per_iter=4, prefill_start=0, prefill_end=args.board*args.board, batch_size=128)
+
     if args.mode == 'train':
         trainer.train_iterations(total_iters=args.iters, episodes_per_iter=4,
                                  prefill_start=0, prefill_end=args.board*args.board, batch_size=128)
 
     if args.mode == 'play':
-        ui = PygameUI(trainer, board_size=args.board, mcts_sim=args.mcts, heuristic_help=(args.guide==1))
-        ui.play_human_vs_ai()
-
-    elif args.mode == 'play':
         ui = PygameUI(trainer, board_size=args.board, mcts_sim=args.mcts, heuristic_help=(args.guide==1))
         ui.play_human_vs_ai()
     elif args.mode == 'selfplay':
