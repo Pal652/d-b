@@ -40,6 +40,8 @@ class Table:
         # Vertical edges: N x (N+1)
         self.vertical = np.zeros((N, N+1), dtype=np.int8)
 
+        self.remaining_boxes = N * N
+
         # Scores for players (Player1 / Player2). We keep separate counters.
         self.scoreA = 0
         self.scoreB = 0
@@ -160,6 +162,7 @@ class Table:
                 self.scoreA += completed
             else:
                 self.scoreB += completed
+            self.remaining_boxes -= completed
             # current player continues
         else:
             # switch turn
@@ -173,17 +176,12 @@ class Table:
         t.vertical = self.vertical.copy()
         t.scoreA = int(self.scoreA)
         t.scoreB = int(self.scoreB)
+        t.remaining_boxes = int(self.remaining_boxes)
         t.FirstPlayer = bool(self.FirstPlayer)
         return t
 
-    def is_full(self):
-        total = int(self.horizontal.sum() + self.vertical.sum())
-        # total edges = (N+1)*N + N*(N+1) = 2*N*(N+1)
-        max_edges = 2 * self.N * (self.N + 1)
-        return total >= max_edges
-
     def game_over(self):
-        return self.is_full()
+        return self.remaining_boxes == 0
 
     def max_score(self):
         return self.N * self.N
@@ -401,29 +399,6 @@ def detect_two_filled_components(table: Table):
     #print(comps)
     return comps
 
-def get_edges_of_twofilled_component_by_starter(state: Table, bx, by): # sus
-    """
-    Return set of edge-moves (('h'|'v',x,y)) that belong to the open component
-    whose first box (starter) is (bx,by). Returns empty set if not found.
-    """
-    comps = detect_two_filled_components(state)
-    target = None
-    for c in comps:
-        if c['sequence'] and c['sequence'][0] == (bx,by):
-            target = c; break
-    if target is None:
-        # try to match any comp having starter same coords (fallback)
-        for c in comps:
-            if (bx,by) in c['sequence']:
-                target = c; break
-    if target is None:
-        return set()
-    edges = set()
-    for (cbx,cby) in target['sequence']:
-        for e in box_empty_edges(state, cbx, cby):
-            edges.add(box_edge_to_move(cbx, cby, e))
-    return edges
-
 # -------------------------
 # Generate root moves with collapse (improved: collapse open 2-filled components)
 # -------------------------
@@ -431,54 +406,80 @@ def generate_root_moves_with_collapse(state: Table):
     """
     Build root moves with:
       - suicidal filtering (if any safe moves exist only those are used)
-      - collapse of *open* 2-filled components into single abstract moves ('open_take',bx,by)
-      - remove internal edges of collapsed components from root move list
+      - remove the edges which do the same thing
     """
+
+    # remove all two filled compoment moves (any moove, that makes a 3 edged shit)
+    # add back the opening moves
+    # return an "ornage" and "red" list for UI
+
+
     legal = state.legal_moves()
     # Step 1: safe moves
-    safe_moves = [mv for mv in legal if not is_suicidal_move(state, mv)]
-    have_safe = bool(safe_moves)
-    use_moves = safe_moves if have_safe else legal[:] # if all unsafe, use all
+
+    
+
+    #move:
+        #sacrify
+            #suicidal
+            #not suicidal (true sacryfy)
+        #safe
+    
+    safe_moves = []
+    TrueSacryfie_moves = []
+    suicidal_moves = []
+
+    for mv in legal:
+        if not is_sacrify_move(state, mv): safe_moves.append(mv)
+        else:       
+            if is_suicidal_move(state, mv): suicidal_moves.append(mv)
+            else:                           TrueSacryfie_moves.append(mv)                    
+        
+
+
+    have_safe = bool(safe_moves) or bool(TrueSacryfie_moves) # there are non suicidal moves
+
+
+    # all suicidal, so any moove is fine COLLAPSING STILL NESSESARY
+
+    use_moves = safe_moves
+
 
     # Step 2: detect open (two-filled) components and prepare collapse
-    collapse_candidates = detect_two_filled_components(state)
-
-    # abstract collapsed actions (we'll use 'open_take' as abstract)
     collapsed_actions = []
-    # also store representative physical move for each abstract (for execution)
-    rep_map = {}
-
+    collapse_candidates = detect_two_filled_components(state)
     for c in collapse_candidates:
         seq = c['sequence']
         bx0, by0 = seq[0]
         # collect all free edges inside this component
 
-        if (have_safe and len(seq) > 2): # do not add open moves for longchains if not nessary
-            continue
+        if (have_safe and len(seq) > 2): continue # long ones are suboptimal
         
         # choose good edge in this component
+        
         e0 = box_empty_edges(state, bx0, by0)[0]
         mv = box_edge_to_move(bx0, by0, e0)
-        for e in box_empty_edges(state, bx0, by0):
-            mv = box_edge_to_move(bx0, by0, e)
-            if is_suicidal_move(state, mv): continue
-            
-        # add abstract collapse action
-        collapsed_actions.append(('open_take', bx0, by0))
-        rep_map[('open_take', bx0, by0)] = mv
+
+        if (len(seq) != 2):
+            collapsed_actions.append(mv)
+            continue
+        
+        # 2 long chain
+        if (mv not in TrueSacryfie_moves):
+            e0 = box_empty_edges(state, bx0, by0)[1]
+            mv = box_edge_to_move(bx0, by0, e0)
+
+        
+        collapsed_actions.append(mv) # add back the chain/loopopening move
 
     # add abstract collapsed actions
     use_moves.extend(collapsed_actions)
 
     if not use_moves:
-        return []
+        return [], [], []
         #raise Exception()
-
-    # attach rep map to the state? No, return rep_map too via attribute on function-level (global-like)
-    # But better: store rep_map in a module-level dict so execute_abstract_move can look it up.
-    # We'll attach to a global helper:
-    generate_root_moves_with_collapse._rep_map = rep_map
-    return use_moves
+    
+    return use_moves, suicidal_moves, TrueSacryfie_moves
 
 
 def domino_moves(table: Table, comp): # gives the devour and decline moves 
@@ -605,22 +606,15 @@ def is_suicidal_move(table: Table, move):
 
     # clone and apply move
     t = table.clone()
+    t.apply_move(move)
 
-    # convert abstract move → actual move (you said you will remove chain_take/loop_take eventually)
-    if isinstance(move, tuple) and move and move[0] == 'open_take':
-        execute_abstract_move(t, move)
-    else:
-        t.apply_move(move)
 
-    # -----------------------------------------
-    # 1) If player gained points -> NOT suicidal
-    # -----------------------------------------
+    # If player gained points -> NOT suicidal
     score_after = t.score
     if score_after != score_before: return False
 
-    # -----------------------------------------
-    # 2) Now check for new dangerous components
-    # -----------------------------------------
+
+    # Now check for new dangerous components
     after = set(_comp_sig(c) for c in detect_chainloop_components(t))
     new = after - before
 
@@ -633,58 +627,15 @@ def is_suicidal_move(table: Table, move):
     return False
 
 
-def get_suicidal_moves(state: Table):
-    suic = set()
-    for mv in state.legal_moves():
-        if is_suicidal_move(state, mv):
-            suic.add(mv)
-    return suic
-
-
-def execute_abstract_move(state: Table, abstract_move):
+def is_sacrify_move(table: Table, move):
     """
-    Apply an abstract action:
-      - ('chain_take', bx, by) or ('loop_take', bx, by): devour starter via domino_moves
-      - ('open_take', bx, by): apply representative physical move (picked in generation)
-    After applying the core move this function will auto-apply forced single moves
-    (non-domino forced moves) until control passes or domino appears.
-    Returns total boxes completed (int) by the whole abstract action.
+    move gives a 3 edged box
     """
-    kind = abstract_move[0]
-    bx = abstract_move[1]
-    by = abstract_move[2]
 
-    if kind == 'h' or kind == 'v':
-        return state.apply_move(abstract_move)
-    
-    if kind == 'open_take':
-        # use rep map prepared by generate_root_moves_with_collapse
-        rep_map = getattr(generate_root_moves_with_collapse, "_rep_map", {})
-        print("rep_map:", rep_map) # rep_map: {('open_take', 1, 1): ('h', 1, 1)}
-        mv = rep_map.get(('open_take', bx, by), None)
-        print("move:", mv)
+    ebs = table.edge_boxes(move)
+    if any(table.box_filled_count(*eb) == 2 for eb in ebs): return True
 
-        if mv is None:
-            raise NotImplementedError()
-        state.apply_move(mv)
-        return 1
-
-    else:
-        raise NotImplementedError() # unknown abstract => nothing
-
-    # Now auto-apply simple forced moves (single non-domino forced), stop if domino or no forced move
-    """while not state.game_over():
-        forced = heuristic_forced_move(state)
-        if forced is None:
-            break
-        if isinstance(forced, dict) and 'domino' in forced:
-            # stop auto resolving dominoes here
-            break
-        if isinstance(forced, tuple):
-            total_completed += state.apply_move(forced)
-            continue
-        break
-    return total_completed"""
+    return False
 
 
 # -------------------------
@@ -786,8 +737,7 @@ class MCTSNode:
         self.visit_count: Dict[Tuple[str,int,int], int] = {}
         self.value_sum: Dict[Tuple[str,int,int], float] = {}
 
-        # N(s)
-        self.total_visits = 0
+        self.total_visits = 0 # N(s)
 
 
 class MCTS:
@@ -808,21 +758,15 @@ class MCTS:
     # ----------------------------------------------------------
     # Utility: expand a node
     # ----------------------------------------------------------
+
     def expand(self, node:MCTSNode, root:bool, allowed_moves):
-        if root:
-            if allowed_moves is not None:
-                moves = [mv for mv in node.state.legal_moves() if mv in allowed_moves] # domino only care about thoose 2 moves 
-            else:
-                moves = generate_root_moves_with_collapse(node.state)
-        else:
-            legal = node.state.legal_moves()
-            safe = [mv for mv in legal if not is_suicidal_move(node.state, mv)]
-            moves = safe if safe else legal
+        if allowed_moves is not None: moves = allowed_moves # domino restriction applies
+        else: moves, _, _ = generate_root_moves_with_collapse(node.state)
 
         if not moves:
             node.is_expanded = True
             return
-
+        
         p = 1.0 / len(moves)
         for mv in moves:
             node.priors[mv] = p
@@ -903,10 +847,7 @@ class MCTS:
                 # create child if missing
                 if mv not in node.children:
                     child_state = node.state.clone()
-                    if isinstance(mv, tuple) and mv[0] in ('open_take'):
-                        execute_abstract_move(child_state, mv)
-                    else:
-                        child_state.apply_move(mv)
+                    child_state.apply_move(mv)
 
                     child = MCTSNode(child_state)
                     node.children[mv] = child
@@ -919,7 +860,15 @@ class MCTS:
             # EXPAND / EVALUATE OR TERMINAL
             # -------------------------
             if not node.is_expanded:
-                self.expand(node, root=False, allowed_moves=None)
+
+                # domino and forced filter for MCTS deeper moves
+                fm = heuristic_forced_move(node.state)
+                if isinstance(fm, dict) and 'domino' in fm: allowed_moves = fm['domino']
+                if isinstance(fm, tuple): allowed_moves = [fm]
+                else: allowed_moves = None
+
+                self.expand(node, root=False, allowed_moves=allowed_moves)
+
                 self.evaluate_leaf(node)
                 continue
 
@@ -962,7 +911,7 @@ class MCTS:
                 best_avg = avg
                 best_mv = mv
 
-        return best_mv
+        return best_mv, root
 
 # -------------------------
 # Self-play with heuristics + domino handling + MCTS
@@ -973,25 +922,44 @@ def self_play_episode(mcts:MCTS, N:int, prefills:int, rng:random.Random):
     for _ in range(prefills):
         if t.game_over(): break
         mv = rng.choice(t.legal_moves()); t.apply_move(mv)
-    
+
+
     states=[]
     was_first=[]
     current_scores = []
+    mcts_values = []
+    remaining_boxes = []
     while not t.game_over():
         states.append(encode_table(t))
         was_first.append(t.FirstPlayer)
         current_scores.append(t.score)
+        remaining_boxes.append(t.remaining_boxes)
 
         forced = heuristic_forced_move(t)
-        allowed_moves = None
+        
         if isinstance(forced, tuple): t.apply_move(forced)
-        if isinstance(forced, dict) and 'domino' in forced: allowed_moves = forced['domino']
-        else: execute_abstract_move(t, (mcts.search(t, allowed_moves)))
+        else:
+            allowed_moves = None
+            if isinstance(forced, dict) and 'domino' in forced: allowed_moves = forced['domino']
+
+            mv, root = mcts.search(t, allowed_moves)
+            print('best move:', mv)
+
+            # Compute MCTS root value estimate (30% of teach target)
+            N_total = max(1, root.total_visits)
+            root_v = 0.0
+            for mv2, N in root.visit_count.items():
+                if N > 0:
+                    avg = root.value_sum[mv2] / N
+                    root_v += avg * (N / N_total)
+            mcts_values.append(root_v)
+
+            t.apply_move(mv)
 
         # forced is either a move tuple, or {'domino': [mvA,mvB]}
     
-    print(t.score)
-    return states, was_first, current_scores, t.score, t.max_score()
+    print("selfplay score:", t.score)
+    return states, was_first, current_scores, mcts_values, remaining_boxes, t.score
 
 # -------------------------
 # Trainer (save/load)
@@ -1050,11 +1018,11 @@ class Trainer:
             frac = it/total_iters
             prefills = int(prefill_start + frac*(prefill_end-prefill_start))
             for _ in range(episodes_per_iter):
-                states, was_first, current_scores, final_diff, maxscore = self_play_episode(self.mcts, self.board_size, prefills, rng)
-                if maxscore<=0: continue
-                for s,w,c in zip(states,was_first,current_scores):
-                    target = (final_diff-c/maxscore)
-                    if not w: target *= -1
+                states, was_first, current_scores, mcts_values, remaining_boxes, final_diff = self_play_episode(self.mcts, self.board_size, prefills, rng)
+                for s, w, c, r, v_mcts in zip(states, was_first, current_scores, remaining_boxes, mcts_values): # calc target
+                    target = ((final_diff-c/r)*0.7)
+                    if not w: target = -target
+                    target += v_mcts*0.3 # already MCTS value, so no need to *-1
                     self.replay.push(s,target)
             # train steps
             if len(self.replay)>=8:
@@ -1131,15 +1099,14 @@ class PygameUI:
                 else:
                     if (not self.heuristic_help):
                         pygame.draw.line(self.screen,(60,60,60),(px,py),(px+cell,py),4)
+                    elif mv in highlight_moves:
+                        pygame.draw.line(self.screen,(100,250,100),(px,py),(px+cell,py),6)
                     elif mv in suicide_edges:
                         pygame.draw.line(self.screen, (220,50,50), (px,py),(px+cell,py),6)  # red
                     elif mv in collapsed_edges:
                         pygame.draw.line(self.screen, (255,140,0), (px,py),(px+cell,py),6)  # orange
-                    elif mv in highlight_moves:
-                        pygame.draw.line(self.screen,(100,250,100),(px,py),(px+cell,py),6)
                     else:
-                        # faint, clickable
-                        pygame.draw.line(self.screen,(60,60,60),(px,py),(px+cell,py),4)
+                        pygame.draw.line(self.screen,(60,60,60),(px,py),(px+cell,py),4) # faint, clickable
 
         # vertical lines
         for y in range(N):
@@ -1152,12 +1119,12 @@ class PygameUI:
                 else:
                     if (not self.heuristic_help):
                         pygame.draw.line(self.screen,(60,60,60),(px,py),(px,py+cell),4)
+                    elif mv in highlight_moves:
+                        pygame.draw.line(self.screen,(100,250,100),(px,py),(px,py+cell),6)
                     elif mv in suicide_edges:
                         pygame.draw.line(self.screen, (220,50,50),(px,py),(px,py+cell),6)
                     elif mv in collapsed_edges:
                         pygame.draw.line(self.screen, (255,140,0),(px,py),(px,py+cell),6)
-                    elif mv in highlight_moves:
-                        pygame.draw.line(self.screen,(100,250,100),(px,py),(px,py+cell),6)
                     else:
                         pygame.draw.line(self.screen,(60,60,60),(px,py),(px,py+cell),4)
 
@@ -1188,16 +1155,9 @@ class PygameUI:
             # compute highlights once per loop/turn
             # suicidal edges (red)
 
-            self._suicide_edges = get_suicidal_moves(table)
-
             # collapsed open components -> orange edges
             self._collapsed_edges = set()
-            root_moves = generate_root_moves_with_collapse(table)
-            # root_moves will set generate_root_moves_with_collapse._rep_map as side-effect
-            for rm in root_moves:
-                if isinstance(rm, tuple) and rm and rm[0] == 'open_take':
-                    bx, by = rm[1], rm[2]
-                    self._collapsed_edges.update(get_edges_of_twofilled_component_by_starter(table, bx, by))
+            _, self._suicide_edges, self._collapsed_edges = generate_root_moves_with_collapse(table) # for color
 
             # compute forced/domino highlights as before
             forced = heuristic_forced_move(table)
@@ -1235,12 +1195,10 @@ class PygameUI:
                     if isinstance(forced, dict) and 'domino' in forced:
                         allowed_moves = forced['domino']
                         #print("allowed moves:", allowed_moves)
-                    mv = self.trainer.mcts.search(table, allowed_moves=allowed_moves)
-                    # Save abstract root moves so UI can highlight them on human turns (?)
-                    root_moves = generate_root_moves_with_collapse(table)
+                    mv, _ = self.trainer.mcts.search(table, allowed_moves=allowed_moves)
 
                     print("enemy move:", mv)
-                    execute_abstract_move(table, mv)
+                    table.apply_move(mv)
                         
             clock.tick(30)
 
@@ -1256,9 +1214,9 @@ class PygameUI:
             allowed_moves = None
             if isinstance(forced, dict) and 'domino' in forced: allowed_moves = forced['domino']
 
-            mv = self.trainer.mcts.search(t, allowed_moves)
+            mv, _ = self.trainer.mcts.search(t, allowed_moves)
             print(mv)
-            execute_abstract_move(t, mv)
+            t.apply_move(mv)
 
             if render: pygame.time.wait(int(delay*1000))
         print("AI vs AI finished. score:", t.score)
@@ -1270,18 +1228,10 @@ class PygameUI:
         clock = pygame.time.Clock()
 
         while running:
-            # compute suicidal edges (red)
-            self._suicide_edges = get_suicidal_moves(table)
 
             # compute collapsed edges (orange)
             self._collapsed_edges = set()
-            root_moves = generate_root_moves_with_collapse(table)
-            for rm in root_moves:
-                if isinstance(rm, tuple) and rm[0] == 'open_take':
-                    bx, by = rm[1], rm[2]
-                    self._collapsed_edges.update(
-                        get_edges_of_twofilled_component_by_starter(table, bx, by)
-                    )
+            _, self._suicide_edges, self._collapsed_edges = generate_root_moves_with_collapse(table) # for color
 
             # forced moves (domino or single)
             forced = heuristic_forced_move(table)
