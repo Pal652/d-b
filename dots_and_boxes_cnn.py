@@ -689,33 +689,36 @@ class BatchEvaluator:
         self.model = model
         self.device = device
         self.batch_size = batch_size
-        self.pending = []  # list of (node, state)
+        self.pending = []  # list of (node, state, path)
 
-    def queue(self, node, state):
+    def queue(self, node, state, path):
         """
         Add a leaf for later batch evaluation.
         Returns True if evaluation has been queued,
         False if batch is full and must be processed immediately.
         """
-        self.pending.append((node, state.clone()))
+        self.pending.append((node, state.clone(), list(path)))
         return len(self.pending) < self.batch_size
 
     def flush(self):
         if not self.pending:
-            return
+            return []
 
         # Encode all tables at once
-        arr = np.stack([encode_table(st) for (_, st) in self.pending], axis=0)
+        arr = np.stack([encode_table(st) for (_, st, _) in self.pending], axis=0)
         inp = torch.from_numpy(arr).to(self.device)
 
         with torch.no_grad():
             vals = self.model(inp).cpu().numpy()
 
-        # Assign values back to nodes
-        for (node, st), v in zip(self.pending, vals):
-            node._pending_value = v.item() if st.FirstPlayer else -v.item()
+        results = []
+        for ((node, st, path), v) in zip(self.pending, vals):
+            # convert to perspective-of-root-leaf: value is from the viewpoint of st.FirstPlayer
+            val = float(v) if st.FirstPlayer else -float(v)
+            results.append((node, val, path))
 
         self.pending.clear()
+        return results
 
 
 import math, numpy as np
@@ -752,15 +755,19 @@ class MCTS:
         self.dirichlet_alpha = dirichlet_alpha
         self.dir_noise_eps = dir_noise_eps
 
-        self.batcher = BatchEvaluator(model, device, batch_size=32)
+        self.batcher = BatchEvaluator(model, device, batch_size=round(num_simulations*0.08))
 
 
     # ----------------------------------------------------------
     # Utility: expand a node
     # ----------------------------------------------------------
 
-    def expand(self, node:MCTSNode, root:bool, allowed_moves):
-        if allowed_moves is not None: moves = allowed_moves # domino restriction applies
+    def expand(self, node:MCTSNode, root:bool):
+
+         # domino and forced filter for MCTS deeper moves
+        fm = heuristic_forced_move(node.state)
+        if isinstance(fm, dict) and 'domino' in fm: moves = fm['domino']
+        if isinstance(fm, tuple): moves = [fm]
         else: moves, _, _ = generate_root_moves_with_collapse(node.state)
 
         if not moves:
@@ -813,11 +820,23 @@ class MCTS:
     # ----------------------------------------------------------
     # Utility: NN evaluation for leaf
     # ----------------------------------------------------------
-    def evaluate_leaf(self, node:MCTSNode):
-        queued = self.batcher.queue(node, node.state)
+    def evaluate_leaf(self, node: MCTSNode, path):
+        queued = self.batcher.queue(node, node.state, path)
         if not queued:
-            self.batcher.flush()
+            # batch full -> flush immediately and return results for processing
+            return self.batcher.flush()
+        return []
+    
+    def PropBack(self, to_prop, path, rootFirstPlayer:bool):
+        for parent, action in reversed(path):
+            if rootFirstPlayer == parent.state.FirstPlayer: corrected_to_prop = to_prop
+            else: corrected_to_prop = -to_prop
 
+            parent.total_visits += 1
+            parent.visit_count[action] += 1
+            parent.value_sum[action] += corrected_to_prop
+
+        #print("backprop leaf, to_prop:", to_prop, "pathlen:", len(path))    
 
     # ----------------------------------------------------------
     # Perform one root-level MCTS search
@@ -859,41 +878,41 @@ class MCTS:
             # -------------------------
             # EXPAND / EVALUATE OR TERMINAL
             # -------------------------
-            if not node.is_expanded:
+            if not node.is_expanded: # new one
+                print(len(path)*'\t' + str(mv))
 
-                # domino and forced filter for MCTS deeper moves
-                fm = heuristic_forced_move(node.state)
-                if isinstance(fm, dict) and 'domino' in fm: allowed_moves = fm['domino']
-                if isinstance(fm, tuple): allowed_moves = [fm]
-                else: allowed_moves = None
+               
 
-                self.expand(node, root=False, allowed_moves=allowed_moves)
+                self.expand(node, root=False, allowed_moves=allowed_moves_for_expand)
 
-                self.evaluate_leaf(node)
-                continue
+                results = self.evaluate_leaf(node, path)
+                if results:
+                    # backpropagate all returned results
+                    for (evaluated_node, val, eval_path) in results:
+                        self.PropBack(val, eval_path, rootFirstPlayer=root.state.FirstPlayer)
+
+                continue # continue to next simulation because leaf evaluation happens asynchronously
 
             if node.state.game_over():
                 final_score = node.state.score
-                v_abs = final_score / max(1, node.state.max_score())
+                v_abs = final_score / max(1, node.state.max_score()) # ------------------------- fix evaluation
                 v = v_abs if node.state.FirstPlayer else -v_abs
-            else:
-                self.evaluate_leaf(node)
+
+                # terminal: backpropagate immediately using current path
+                self.PropBack(v, path, rootFirstPlayer=root.state.FirstPlayer)
+            else: # wut?
+                # non-terminal leaf already expanded earlier (rare), queue for eval
+                results = self.evaluate_leaf(node, path)
+                if results:
+                    for (evaluated_node, val, eval_path) in results:
+                        self.PropBack(val, eval_path, rootFirstPlayer=root.state.FirstPlayer)
                 continue
 
-            # -------------------------
-            # BACKPROP
-            # -------------------------
-            self.batcher.flush()
-
-            if hasattr(node, "_pending_value"):
-                v = node._pending_value
-                del node._pending_value
-
-                for parent, action in reversed(path):
-                    parent.total_visits += 1
-                    parent.visit_count[action] += 1
-                    parent.value_sum[action] += v
-                    v = -v
+            # Try to flush any remaining pending evaluations occasionally
+            ready = self.batcher.flush()
+            if ready:
+                for (evaluated_node, val, eval_path) in ready:
+                    self.PropBack(val, eval_path, rootFirstPlayer=root.state.FirstPlayer)
 
         # ------------------------------------------
         # PICK BEST ROOT MOVE
@@ -1287,7 +1306,7 @@ class PygameUI:
 # -------------------------
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('mode', choices=['play','train','selfplay','pvp'], help='Mode')
+    #parser.add_argument('mode', choices=['play','train','selfplay','pvp'], help='Mode')
     parser.add_argument('--board', type=int, default=4)
     parser.add_argument('--guide', type=int, default=1) # help player with heuristics
     parser.add_argument('--device', default='cpu')
@@ -1301,7 +1320,7 @@ def main():
         trainer.load(args.load)
 
     #debug
-    #trainer.train_iterations(total_iters=args.iters, episodes_per_iter=4, prefill_start=0, prefill_end=args.board*args.board, batch_size=128)
+    trainer.train_iterations(total_iters=args.iters, episodes_per_iter=4, prefill_start=0, prefill_end=args.board*args.board, batch_size=128)
 
     if args.mode == 'train':
         trainer.train_iterations(total_iters=args.iters, episodes_per_iter=4,
@@ -1313,7 +1332,7 @@ def main():
     elif args.mode == 'selfplay':
         ui = PygameUI(trainer, board_size=args.board, mcts_sim=args.mcts)
         ui.play_ai_vs_ai(render=True)
-    elif args.mode == 'pvp':       # ✔ NEW MODE — Human vs Human
+    elif args.mode == 'pvp':       # NEW MODE — Human vs Human
         ui = PygameUI(trainer, board_size=args.board, mcts_sim=args.mcts, heuristic_help=(args.guide==1))
         ui.play_human_vs_human()
 
