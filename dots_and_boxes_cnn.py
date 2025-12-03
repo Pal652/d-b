@@ -711,7 +711,10 @@ class BatchEvaluator:
         with torch.no_grad():
             vals = self.model(inp).cpu().numpy()
 
+        self.pending # debub
+
         results = []
+        # node is NOT path[-1][0] btw
         for ((node, st, path), v) in zip(self.pending, vals):
             # convert to perspective-of-root-leaf: value is from the viewpoint of st.FirstPlayer
             val = float(v) if st.FirstPlayer else -float(v)
@@ -767,7 +770,7 @@ class MCTS:
          # domino and forced filter for MCTS deeper moves
         fm = heuristic_forced_move(node.state)
         if isinstance(fm, dict) and 'domino' in fm: moves = fm['domino']
-        if isinstance(fm, tuple): moves = [fm]
+        elif isinstance(fm, tuple): moves = [fm]
         else: moves, _, _ = generate_root_moves_with_collapse(node.state)
 
         if not moves:
@@ -820,22 +823,34 @@ class MCTS:
     # ----------------------------------------------------------
     # Utility: NN evaluation for leaf
     # ----------------------------------------------------------
-    def evaluate_leaf(self, node: MCTSNode, path):
+    def evaluate_leaf(self, node: MCTSNode, path:List[Tuple[MCTSNode, Tuple[str,int,int]]]):
         queued = self.batcher.queue(node, node.state, path)
         if not queued:
             # batch full -> flush immediately and return results for processing
             return self.batcher.flush()
         return []
     
-    def PropBack(self, to_prop, path, rootFirstPlayer:bool):
-        for parent, action in reversed(path):
-            if rootFirstPlayer == parent.children[action].state.FirstPlayer: corrected_to_prop = to_prop
-            else: corrected_to_prop = -to_prop
+    def PropBack(self, to_prop, leaf: MCTSNode, path:List[Tuple[MCTSNode, Tuple[str,int,int]]]):
 
-            parent.value_sum[action] += corrected_to_prop # check
+        # in the tree every value is from the viewpoint of the NodePlayer,
+        # but the Neural network gives the value from the viewpoint of the FirstPlayer
+
+
+        # get Score_pred of nn for state from value
+        corrected_to_prop *= leaf.state.remaining_boxes # total delta_score
+        corrected_to_prop += leaf.state.score
+        
+        for node, action in reversed(path):
+            # node goes from        ] leaf ; root ]
+
+            if node.state.FirstPlayer == leaf.state.FirstPlayer: corrected_to_prop =  to_prop
+            else:                                                corrected_to_prop = -to_prop
+
+
+            if (node.children[action].state.remaining_boxes == 0): continue
+            node.value_sum[action] += ((corrected_to_prop - node.state.score) / node.state.remaining_boxes)
             
-            #print("backprop leaf, to_prop:", to_prop, "pathlen:", len(path))    
-
+            #print("backprop leaf, to_prop:", to_prop, "pathlen:", len(path))
 
     def ApplyVisitIncrements(self, path):
         for parent, action in path:
@@ -883,7 +898,7 @@ class MCTS:
             # EXPAND / EVALUATE OR TERMINAL
             # -------------------------
             if not node.is_expanded: # new one
-                print(len(path)*'\t' + str(mv))
+                #print(len(path)*'\t' + str(mv))
 
                 self.ApplyVisitIncrements(path)
                 self.expand(node, root=False)
@@ -892,7 +907,7 @@ class MCTS:
                 if results:
                     # backpropagate all returned results
                     for (evaluated_node, val, eval_path) in results:
-                        self.PropBack(val, eval_path, rootFirstPlayer=root.state.FirstPlayer)
+                        self.PropBack(val, evaluated_node, eval_path)
 
                 continue # continue to next simulation because leaf evaluation happens asynchronously
 
@@ -902,20 +917,20 @@ class MCTS:
                 v = v_abs if node.state.FirstPlayer else -v_abs
 
                 # terminal: backpropagate immediately using current path
-                self.PropBack(v, path, rootFirstPlayer=root.state.FirstPlayer)
+                self.PropBack(v, node, path)
             else: # wut?
                 # non-terminal leaf already expanded earlier (rare), queue for eval
                 results = self.evaluate_leaf(node, path)
                 if results:
                     for (evaluated_node, val, eval_path) in results:
-                        self.PropBack(val, eval_path, rootFirstPlayer=root.state.FirstPlayer)
+                        self.PropBack(val, evaluated_node, eval_path)
                 continue
 
             # Try to flush any remaining pending evaluations occasionally
             ready = self.batcher.flush()
             if ready:
                 for (evaluated_node, val, eval_path) in ready:
-                    self.PropBack(val, eval_path, rootFirstPlayer=root.state.FirstPlayer)
+                    self.PropBack(val, evaluated_node, eval_path)
 
         # ------------------------------------------
         # PICK BEST ROOT MOVE
@@ -933,6 +948,9 @@ class MCTS:
                 best_avg = avg
                 best_mv = mv
 
+        if best_mv is None:
+            raise Exception()
+
         return best_mv, root
 
 # -------------------------
@@ -946,39 +964,38 @@ def self_play_episode(mcts:MCTS, N:int, prefills:int, rng:random.Random):
         mv = rng.choice(t.legal_moves()); t.apply_move(mv)
 
 
-    states=[]
-    was_first=[]
-    current_scores = []
-    mcts_values = []
-    remaining_boxes = []
+    root_was_first=[]
+    root_encoded_states=[]
+    root_scores = []
+    root_remaining_boxes = []
+    root_mcts_values = []
     while not t.game_over():
-        states.append(encode_table(t))
-        was_first.append(t.FirstPlayer)
-        current_scores.append(t.score)
-        remaining_boxes.append(t.remaining_boxes)
+        root_encoded_states.append(encode_table(t))
+        root_was_first.append(t.FirstPlayer)
+        root_scores.append(t.score)
+        root_remaining_boxes.append(t.remaining_boxes)
 
         forced = heuristic_forced_move(t)
         
         if isinstance(forced, tuple): t.apply_move(forced)
         else:
             mv, root = mcts.search(t)
-            print('best move:', mv)
+            #print('best move:', mv)
 
             # Compute MCTS root value estimate (30% of teach target)
             N_total = max(1, root.total_visits)
             root_v = 0.0
-            for mv2, N in root.visit_count.items():
-                if N > 0:
-                    avg = root.value_sum[mv2] / N
-                    root_v += avg * (N / N_total)
-            mcts_values.append(root_v)
+            for mv2, N in root.visit_count.items(): root_v += root.value_sum[mv2]
+            root_v /= N_total
+            root_mcts_values.append(root_v)
 
             t.apply_move(mv)
 
         # forced is either a move tuple, or {'domino': [mvA,mvB]}
     
+    final_score = t.score
     print("selfplay score:", t.score)
-    return states, was_first, current_scores, mcts_values, remaining_boxes, t.score
+    return root_encoded_states, root_was_first, root_scores, root_mcts_values, root_remaining_boxes, final_score
 
 # -------------------------
 # Trainer (save/load)
@@ -1044,14 +1061,13 @@ class Trainer:
             prefills = int(prefill_start + frac*(prefill_end-prefill_start)) # prefill increments??? from start to end linearly
 
             for _ in range(episodes_per_iter): # how many games to play before incresing??? prefil
-                encoded_states, was_first, current_scores, mcts_values, remaining_boxes, final_diff = self_play_episode(self.mcts, self.board_size, prefills, rng)
+                root_encoded_states, root_was_first, root_scores, root_mcts_values, root_remaining_boxes, final_score = self_play_episode(self.mcts, self.board_size, prefills, rng)
 
-                # calc target
-                for s, w, c, r, v_mcts in zip(encoded_states, was_first, current_scores, remaining_boxes, mcts_values):
-                    target = ((final_diff-c/r)*0.7)
-                    if not w: target = -target
-                    target += v_mcts*0.3 # already MCTS value, so no need to *-1
-                    self.replay.push(s,target)
+                # calc target (verified)
+                for state, wf, root_score, v_mcts, root_rem_box in zip(root_encoded_states, root_was_first, root_scores, root_mcts_values, root_remaining_boxes):
+                    target = ((final_score-root_score)/root_rem_box)*0.7 + v_mcts*0.3
+                    if not wf: target = -target
+                    self.replay.push(state,target)
             
             # train steps
             if len(self.replay)>=8:
@@ -1234,17 +1250,21 @@ class PygameUI:
 
     def play_ai_vs_ai(self, render=True, delay=0.2):
         t = Table(self.board_size, UI=True)
+        if render: self.draw_board(t)
         while not t.game_over():
-            if render: self.draw_board(t)
 
-            forced = heuristic_forced_move(t)
-            if isinstance(forced, tuple): t.apply_move(forced); continue
+             for event in pygame.event.get():
+                if event.type==pygame.MOUSEBUTTONDOWN:
+                    if render: self.draw_board(t)
 
-            mv, _ = self.trainer.mcts.search(t)
-            print(mv)
-            t.apply_move(mv)
+                    forced = heuristic_forced_move(t)
+                    if isinstance(forced, tuple): t.apply_move(forced); continue
 
-            if render: pygame.time.wait(int(delay*1000))
+                    mv, _ = self.trainer.mcts.search(t)
+                    print(mv)
+                    t.apply_move(mv)
+
+                    if render: pygame.time.wait(int(delay*1000))
         print("AI vs AI finished. score:", t.score)
         if render: pygame.time.wait(2000)
 
@@ -1313,7 +1333,7 @@ class PygameUI:
 # -------------------------
 def main():
     parser = argparse.ArgumentParser()
-    #parser.add_argument('mode', choices=['play','train','selfplay','pvp'], help='Mode')
+    parser.add_argument('mode', choices=['play','train','selfplay','pvp'], help='Mode')
     parser.add_argument('--board', type=int, default=4)
     parser.add_argument('--guide', type=int, default=1) # help player with heuristics
     parser.add_argument('--device', default='cpu')
@@ -1327,7 +1347,7 @@ def main():
         trainer.load(args.load)
 
     #debug
-    trainer.train_iterations(total_iters=args.iters, episodes_per_iter=4, prefill_start=0, prefill_end=args.board*args.board, batch_size=128)
+    #trainer.train_iterations(total_iters=args.iters, episodes_per_iter=4, prefill_start=0, prefill_end=args.board*args.board, batch_size=128)
 
     if args.mode == 'train':
         trainer.train_iterations(total_iters=args.iters, episodes_per_iter=4,
