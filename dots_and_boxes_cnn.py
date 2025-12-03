@@ -665,14 +665,14 @@ class DotsValueNet(nn.Module):
 # -------------------------
 class ReplayBuffer:
     def __init__(self, capacity=50000):
-        self.buf = deque(maxlen=capacity)
+        self.buf = deque(maxlen=capacity) # (encoded states, target values)
 
     def push(self, s: np.ndarray, target: float):
         self.buf.append((s.astype(np.float32), float(target)))
 
     def sample(self, n):
         n = min(n, len(self.buf))
-        batch = random.sample(self.buf, n)
+        batch = random.sample(self.buf, n) # gives n game X, Y-s
         states = np.stack([b[0] for b in batch], axis=0)
         targets = np.array([b[1] for b in batch], dtype=np.float32)
         return states, targets
@@ -829,23 +829,27 @@ class MCTS:
     
     def PropBack(self, to_prop, path, rootFirstPlayer:bool):
         for parent, action in reversed(path):
-            if rootFirstPlayer == parent.state.FirstPlayer: corrected_to_prop = to_prop
+            if rootFirstPlayer == parent.children[action].state.FirstPlayer: corrected_to_prop = to_prop
             else: corrected_to_prop = -to_prop
 
+            parent.value_sum[action] += corrected_to_prop # check
+            
+            #print("backprop leaf, to_prop:", to_prop, "pathlen:", len(path))    
+
+
+    def ApplyVisitIncrements(self, path):
+        for parent, action in path:
             parent.total_visits += 1
             parent.visit_count[action] += 1
-            parent.value_sum[action] += corrected_to_prop
-
-        #print("backprop leaf, to_prop:", to_prop, "pathlen:", len(path))    
 
     # ----------------------------------------------------------
     # Perform one root-level MCTS search
     # ----------------------------------------------------------
-    def search(self, root_state:Table, allowed_moves):
+    def search(self, root_state:Table):
         root = MCTSNode(root_state.clone())
 
         # initial expansion + noise
-        self.expand(root, root=True, allowed_moves=allowed_moves)
+        self.expand(root, root=True)
         self.add_root_noise(root)
 
         for _ in range(self.num_simulations):
@@ -881,9 +885,8 @@ class MCTS:
             if not node.is_expanded: # new one
                 print(len(path)*'\t' + str(mv))
 
-               
-
-                self.expand(node, root=False, allowed_moves=allowed_moves_for_expand)
+                self.ApplyVisitIncrements(path)
+                self.expand(node, root=False)
 
                 results = self.evaluate_leaf(node, path)
                 if results:
@@ -958,10 +961,7 @@ def self_play_episode(mcts:MCTS, N:int, prefills:int, rng:random.Random):
         
         if isinstance(forced, tuple): t.apply_move(forced)
         else:
-            allowed_moves = None
-            if isinstance(forced, dict) and 'domino' in forced: allowed_moves = forced['domino']
-
-            mv, root = mcts.search(t, allowed_moves)
+            mv, root = mcts.search(t)
             print('best move:', mv)
 
             # Compute MCTS root value estimate (30% of teach target)
@@ -1020,40 +1020,55 @@ class Trainer:
         for _ in range(120):
             t = Table(self.board_size, UI=False)
             k = rng.randint(0,2)
-            for _ in range(k):
+            for _ in range(k): # apply max 2 moves ?
                 moves = t.legal_moves()
                 if not moves: break
                 t.apply_move(rng.choice(moves))
-            s_local=[]; w_local=[]
+            
+            s_local=[] # pure edges of a random game state
+            w_local=[] # current players in the given states
             while not t.game_over():
-                s_local.append(encode_table(t)); w_local.append(t.FirstPlayer)
+                s_local.append(encode_table(t))
+                w_local.append(t.FirstPlayer)
                 t.apply_move(rng.choice(t.legal_moves()))
-            final = t.score; maxs=t.max_score()
-            for s,w in zip(s_local,w_local):
-                target = (final/maxs) if w else (-final/maxs)
-                self.replay.push(s,target)
+            
+            final = t.score
+            maxs = t.max_score()
+            for s,w in zip(s_local,w_local): # target (needs rework)
+                target = (final/maxs) if w else (-final/maxs) # if this is the root, how much can he win (but bad, because of the premoves makes the first_player change)
+                self.replay.push(s,target) # DO NOT PUSH forced move states (also use heuristics druing randomplay!)
+        
         print("Initial replay size:", len(self.replay))
         for it in range(1, total_iters+1):
             frac = it/total_iters
-            prefills = int(prefill_start + frac*(prefill_end-prefill_start))
-            for _ in range(episodes_per_iter):
-                states, was_first, current_scores, mcts_values, remaining_boxes, final_diff = self_play_episode(self.mcts, self.board_size, prefills, rng)
-                for s, w, c, r, v_mcts in zip(states, was_first, current_scores, remaining_boxes, mcts_values): # calc target
+            prefills = int(prefill_start + frac*(prefill_end-prefill_start)) # prefill increments??? from start to end linearly
+
+            for _ in range(episodes_per_iter): # how many games to play before incresing??? prefil
+                encoded_states, was_first, current_scores, mcts_values, remaining_boxes, final_diff = self_play_episode(self.mcts, self.board_size, prefills, rng)
+
+                # calc target
+                for s, w, c, r, v_mcts in zip(encoded_states, was_first, current_scores, remaining_boxes, mcts_values):
                     target = ((final_diff-c/r)*0.7)
                     if not w: target = -target
                     target += v_mcts*0.3 # already MCTS value, so no need to *-1
                     self.replay.push(s,target)
+            
             # train steps
             if len(self.replay)>=8:
-                for _ in range(4):
-                    st, tg = self.replay.sample(batch_size)
-                    stt = torch.from_numpy(st).float().to(self.device)
-                    tgt = torch.from_numpy(tg).float().to(self.device)
+                for _ in range(4): # 4 learning step
+                    st, tg = self.replay.sample(batch_size) # states, targets
+                    stt = torch.from_numpy(st).float().to(self.device) # transformed for model
+                    tgt = torch.from_numpy(tg).float().to(self.device) # transformed for model
                     self.model.train()
+
                     preds = self.model(stt)
                     loss = F.mse_loss(preds, tgt)
-                    self.optimizer.zero_grad(); loss.backward(); self.optimizer.step()
+                    self.optimizer.zero_grad()
+                    loss.backward()
+                    self.optimizer.step()
+
             if it%log_every==0 or it==1:
+                pass
                 print(f"Iter {it}/{total_iters} | replay={len(self.replay)} | prefills={prefills}")
             if it%200==0:
                 self.save(f"dots_value_checkpoint_it{it}.pt")
@@ -1210,11 +1225,7 @@ class PygameUI:
                 if isinstance(forced, tuple): 
                     table.apply_move(forced)
                 else:
-                    allowed_moves = None
-                    if isinstance(forced, dict) and 'domino' in forced:
-                        allowed_moves = forced['domino']
-                        #print("allowed moves:", allowed_moves)
-                    mv, _ = self.trainer.mcts.search(table, allowed_moves=allowed_moves)
+                    mv, _ = self.trainer.mcts.search(table)
 
                     print("enemy move:", mv)
                     table.apply_move(mv)
@@ -1229,11 +1240,7 @@ class PygameUI:
             forced = heuristic_forced_move(t)
             if isinstance(forced, tuple): t.apply_move(forced); continue
 
-            #if isinstance()
-            allowed_moves = None
-            if isinstance(forced, dict) and 'domino' in forced: allowed_moves = forced['domino']
-
-            mv, _ = self.trainer.mcts.search(t, allowed_moves)
+            mv, _ = self.trainer.mcts.search(t)
             print(mv)
             t.apply_move(mv)
 
