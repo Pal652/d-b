@@ -1340,7 +1340,7 @@ class PygameUI:
 # -------------------------
 def main():
     parser = argparse.ArgumentParser()
-    #parser.add_argument('mode', choices=['play','train','selfplay','pvp'], help='Mode')
+    parser.add_argument('mode', choices=['play','train','selfplay','pvp'], help='Mode')
     parser.add_argument('--board', type=int, default=4)
     parser.add_argument('--guide', type=int, default=1) # help player with heuristics
     parser.add_argument('--device', default='cpu')
@@ -1355,7 +1355,7 @@ def main():
         #trainer.load('4x4_beta.pt')
 
     #debug
-    trainer.train_iterations(total_iters=args.iters, episodes_per_iter=4, prefill_start=0, prefill_end=args.board*args.board, batch_size=128)
+    #trainer.train_iterations(total_iters=args.iters, episodes_per_iter=4, prefill_start=0, prefill_end=args.board*args.board, batch_size=128)
 
     #ui = PygameUI(trainer, board_size=args.board, mcts_sim=args.mcts, heuristic_help=(args.guide==1))
     #ui.play_human_vs_ai()
