@@ -760,7 +760,7 @@ class MCTS:
         self.dirichlet_alpha = dirichlet_alpha
         self.dir_noise_eps = dir_noise_eps
 
-        self.batcher = BatchEvaluator(model, device, batch_size=round(num_simulations*0.08))
+        self.batcher = BatchEvaluator(model, device, batch_size=1)#round(num_simulations*0.08))
 
 
     # ----------------------------------------------------------
@@ -833,28 +833,38 @@ class MCTS:
             return self.batcher.flush()
         return []
     
+    #"""
     def PropBack(self, to_prop, leaf: MCTSNode, path:List[Tuple[MCTSNode, Tuple[str,int,int]]]):
 
-        # in the tree every value is from the viewpoint of the NodePlayer,
-        # but the Neural network gives the value from the viewpoint of the FirstPlayer
+        #to_prop = 0 # debug test MCTS
 
+        # in the tree every value is from the viewpoint of the NodePlayer,
+        # but the Neural network gives the value from the viewpoint of the NodePlayer
+
+        # back to FP pov (neural network deosent now who comes first, so it is node player pov)
+        if (not leaf.state.FirstPlayer): to_prop = -to_prop # to FP pov
 
         # get Score_pred of nn for state from value ((Score_end-Score_node)/Boxes_left) - backwards
-        corrected_to_prop = to_prop
-        corrected_to_prop *= leaf.state.remaining_boxes # total delta_score
-        corrected_to_prop += leaf.state.score
+        full_game_score_pred = to_prop
+        full_game_score_pred *= leaf.state.remaining_boxes # total delta_score
+        full_game_score_pred += leaf.state.score # pred points
         
         for node, action in reversed(path):
             # node goes from        ] leaf ; root ]
-
-            if node.state.FirstPlayer == leaf.state.FirstPlayer: final_score_node_P =  corrected_to_prop # because tree sotre by node
-            else:                                                final_score_node_P = -corrected_to_prop
-
-
-            if (node.state.remaining_boxes == 0): continue
-            node.value_sum[action] += ((final_score_node_P - node.state.score) / node.state.remaining_boxes)
             
-            #print("backprop leaf, to_prop:", to_prop, "pathlen:", len(path))
+            # root to lef points + pred points
+            if (node.state.remaining_boxes == 0): continue
+
+            # to node player pov
+            nodePov = ((full_game_score_pred - node.state.score) / node.state.remaining_boxes)
+            if (not node.state.FirstPlayer): nodePov = -nodePov
+
+
+            node.value_sum[action] += nodePov
+
+
+            #print("backprop leaf, to_prop:", to_prop, "pathlen:", len(path)
+
 
     def ApplyVisitIncrements(self, path):
         for parent, action in path:
@@ -918,6 +928,7 @@ class MCTS:
             if node.state.game_over():
                 if node.state.game_over():
                     v_net = 0.0       # consistent normalized terminal value
+                    self.ApplyVisitIncrements(path)
                     self.PropBack(v_net, node, path)
                     continue
             else: # wut?
@@ -1368,10 +1379,10 @@ def main():
         #trainer.load('4x4_beta.pt')
 
     #debug
-    trainer.train_iterations(total_iters=args.iters, episodes_per_iter=4, prefill_start=0, prefill_end=args.board*args.board, batch_size=128)
+    #trainer.train_iterations(total_iters=args.iters, episodes_per_iter=4, prefill_start=0, prefill_end=args.board*args.board, batch_size=128)
 
-    #ui = PygameUI(trainer, board_size=args.board, mcts_sim=args.mcts, heuristic_help=(args.guide==1))
-    #ui.play_human_vs_ai()
+    ui = PygameUI(trainer, board_size=args.board, mcts_sim=args.mcts, heuristic_help=(args.guide==1))
+    ui.play_human_vs_ai()
 
     if args.mode == 'train':
         trainer.train_iterations(total_iters=args.iters, episodes_per_iter=4,
