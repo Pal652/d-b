@@ -187,6 +187,9 @@ class Table:
 
     def max_score(self):
         return self.N * self.N
+    
+    def __hash__(self):
+        return hash((self.horizontal.tobytes(), self.vertical.tobytes()))
 
 
 
@@ -693,13 +696,13 @@ class BatchEvaluator:
         self.batch_size = batch_size
         self.pending = []  # list of (node, state, path)
 
-    def queue(self, node, state, path):
+    def queue(self, node, path):
         """
         Add a leaf for later batch evaluation.
         Returns True if evaluation has been queued,
         False if batch is full and must be processed immediately.
         """
-        self.pending.append((node, state.clone(), list(path)))
+        self.pending.append((node, list(path)))
         return len(self.pending) < self.batch_size
 
     def flush(self):
@@ -707,7 +710,7 @@ class BatchEvaluator:
             return []
 
         # Encode all tables at once
-        arr = np.stack([encode_table(st) for (_, st, _) in self.pending], axis=0)
+        arr = np.stack([encode_table(node.node.state) for (node, _) in self.pending], axis=0)
         inp = torch.from_numpy(arr).to(self.device)
 
         with torch.no_grad():
@@ -717,9 +720,9 @@ class BatchEvaluator:
 
         results = []
         # node is NOT path[-1][0] btw
-        for ((node, st, path), v) in zip(self.pending, vals):
+        for ((node, path), v) in zip(self.pending, vals):
             # convert to perspective-of-root-leaf: value is from the viewpoint of st.FirstPlayer
-            val = float(v) if st.FirstPlayer else -float(v)
+            val = float(v) if node.FirstPlayer else -float(v)
             results.append((node, val, path))
 
         self.pending.clear()
@@ -732,7 +735,7 @@ import torch
 import torch.nn as nn
 
 
-class MCTSNode:
+class MCTS_inner_Node:
     def __init__(self, state:Table):
         self.state = state
         self.is_expanded = False
@@ -746,6 +749,25 @@ class MCTSNode:
         self.value_sum: Dict[Tuple[str,int,int], float] = {}
 
         self.total_visits = 0 # N(s)
+
+class MCTSNode:
+    def __init__(self):
+        # call from_node or from_table
+        self.node = None
+        self.FirstPlayer = None
+        self.Score = None
+
+    def from_node(self, node:MCTS_inner_Node, FirstPlayer, Score): # same state as an already checked one.
+        self.node = node
+        self.FirstPlayer = FirstPlayer
+        self.Score = Score
+        return self
+
+    def from_table(self, table:Table): # new state
+        self.node = MCTS_inner_Node(table)
+        self.FirstPlayer = table.FirstPlayer
+        self.Score = table.score
+        return self
 
 
 class MCTS:
@@ -762,45 +784,47 @@ class MCTS:
 
         self.batcher = BatchEvaluator(model, device, batch_size=1)#round(num_simulations*0.08))
 
+        self.nodes: Dict[int, MCTS_inner_Node] = {} # table hash to MCTSNode
+
 
     # ----------------------------------------------------------
     # Utility: expand a node
     # ----------------------------------------------------------
 
-    def expand(self, node:MCTSNode, root:bool):
+    def expand(self, node:MCTSNode):
 
          # domino and forced filter for MCTS deeper moves
-        fm = heuristic_forced_move(node.state)
+        fm = heuristic_forced_move(node.node.state)
         if isinstance(fm, dict) and 'domino' in fm:
             moves = fm['domino']
         elif isinstance(fm, tuple): moves = [fm]
-        else: moves, _, _ = generate_root_moves_with_collapse(node.state)
+        else: moves, _, _ = generate_root_moves_with_collapse(node.node.state)
 
         if not moves:
-            node.is_expanded = True
+            node.node.is_expanded = True
             return
         
         p = 1.0 / len(moves)
         for mv in moves:
-            node.priors[mv] = p
-            node.visit_count[mv] = 0
-            node.value_sum[mv] = 0.0
+            node.node.priors[mv] = p
+            node.node.visit_count[mv] = 0
+            node.node.value_sum[mv] = 0.0
 
-        node.is_expanded = True
+        node.node.is_expanded = True
 
 
     # ----------------------------------------------------------
     # Utility: add Dirichlet noise at root
     # ----------------------------------------------------------
     def add_root_noise(self, node:MCTSNode):
-        moves = list(node.priors.keys())
+        moves = list(node.node.priors.keys())
         if not moves: 
             return
 
         noise = np.random.dirichlet([self.dirichlet_alpha]*len(moves))
         for mv, eps in zip(moves, noise):
-            old = node.priors[mv]
-            node.priors[mv] = old*(1-self.dir_noise_eps) + eps*self.dir_noise_eps
+            old = node.node.priors[mv]
+            node.node.priors[mv] = old*(1-self.dir_noise_eps) + eps*self.dir_noise_eps
 
 
     # ----------------------------------------------------------
@@ -810,11 +834,11 @@ class MCTS:
         best = -1e9
         best_mv = None
 
-        sqrt_parent = math.sqrt(max(1, node.total_visits))
+        sqrt_parent = math.sqrt(max(1, node.node.total_visits))
 
-        for mv, P in node.priors.items():
-            N = node.visit_count[mv]
-            Q = (node.value_sum[mv] / N) if N > 0 else 0.0
+        for mv, P in node.node.priors.items():
+            N = node.node.visit_count[mv]
+            Q = (node.node.value_sum[mv] / N) if N > 0 else 0.0
             u = Q + self.c_puct * P * sqrt_parent / (1 + N)
             if u > best:
                 best = u
@@ -827,7 +851,7 @@ class MCTS:
     # Utility: NN evaluation for leaf
     # ----------------------------------------------------------
     def evaluate_leaf(self, node: MCTSNode, path:List[Tuple[MCTSNode, Tuple[str,int,int]]]):
-        queued = self.batcher.queue(node, node.state, path)
+        queued = self.batcher.queue(node, path)
         if not queued:
             # batch full -> flush immediately and return results for processing
             return self.batcher.flush()
@@ -842,25 +866,25 @@ class MCTS:
         # but the Neural network gives the value from the viewpoint of the NodePlayer
 
         # back to FP pov (neural network deosent now who comes first, so it is node player pov)
-        if (not leaf.state.FirstPlayer): to_prop = -to_prop # to FP pov
+        if (not leaf.FirstPlayer): to_prop = -to_prop # to FP pov
 
         # get Score_pred of nn for state from value ((Score_end-Score_node)/Boxes_left) - backwards
         full_game_score_pred = to_prop
-        full_game_score_pred *= leaf.state.remaining_boxes # total delta_score
-        full_game_score_pred += leaf.state.score # pred points
+        full_game_score_pred *= leaf.node.state.remaining_boxes # total delta_score
+        full_game_score_pred += leaf.Score # pred points
         
         for node, action in reversed(path):
             # node goes from        ] leaf ; root ]
             
             # root to lef points + pred points
-            if (node.state.remaining_boxes == 0): continue
+            if (node.node.state.remaining_boxes == 0): continue
 
             # to node player pov
-            nodePov = ((full_game_score_pred - node.state.score) / node.state.remaining_boxes)
-            if (not node.state.FirstPlayer): nodePov = -nodePov
+            nodePov = ((full_game_score_pred - node.Score) / node.node.state.remaining_boxes)
+            if (not node.FirstPlayer): nodePov = -nodePov
 
 
-            node.value_sum[action] += nodePov
+            node.node.value_sum[action] += nodePov
 
 
             #print("backprop leaf, to_prop:", to_prop, "pathlen:", len(path)
@@ -868,17 +892,20 @@ class MCTS:
 
     def ApplyVisitIncrements(self, path):
         for parent, action in path:
-            parent.total_visits += 1
-            parent.visit_count[action] += 1
+            parent.node.total_visits += 1
+            parent.node.visit_count[action] += 1
 
     # ----------------------------------------------------------
     # Perform one root-level MCTS search
     # ----------------------------------------------------------
     def search(self, root_state:Table):
-        root = MCTSNode(root_state.clone())
+        
+        self.nodes.clear()
+
+        root = MCTSNode().from_table(root_state.clone())
 
         # initial expansion + noise
-        self.expand(root, root=True)
+        self.expand(root)
         self.add_root_noise(root)
 
         for _ in range(self.num_simulations):
@@ -889,7 +916,7 @@ class MCTS:
             # -------------------------
             # SELECTION
             # -------------------------
-            while node.is_expanded and node.priors:
+            while node.node.is_expanded and node.node.priors:
                 mv = self.select_move(node)
                 if mv is None:
                     break
@@ -897,25 +924,44 @@ class MCTS:
                 path.append((node, mv))
 
                 # create child if missing
-                if mv not in node.children:
-                    child_state = node.state.clone()
+                if mv not in node.node.children:
+                    child_state = node.node.state.clone()
                     child_state.apply_move(mv)
 
-                    child = MCTSNode(child_state)
-                    node.children[mv] = child
+
+                    # setup decorated DAP structure (tree with repeated nodes)
+                    hash_ = child_state.__hash__()
+                    realNew = False
+                    if (self.nodes.__contains__(hash_)):
+                        # already explored in tree as different node but similar state
+                        others_inner_node = self.nodes[hash_]
+                        child = MCTSNode().from_node(others_inner_node, child_state.FirstPlayer, child_state.score)
+                        
+                        # continue
+                    else:
+                        # new node
+                        realNew = True
+                        child = MCTSNode().from_table(child_state)
+                        self.nodes[hash_] = child.node
+
+                    
+
+                    node.node.children[mv] = child
                     node = child
-                    break
+                        
+                        
+                    if (realNew): break
                 else:
-                    node = node.children[mv]
+                    node = node.node.children[mv]
 
             # -------------------------
             # EXPAND / EVALUATE OR TERMINAL
             # -------------------------
-            if not node.is_expanded: # new one
+            if not node.node.is_expanded: # new one
                 #print(len(path)*'\t' + str(mv))
 
                 self.ApplyVisitIncrements(path)
-                self.expand(node, root=False)
+                self.expand(node)
 
                 results = self.evaluate_leaf(node, path)
                 if results:
@@ -925,8 +971,8 @@ class MCTS:
 
                 continue # continue to next simulation because leaf evaluation happens asynchronously
 
-            if node.state.game_over():
-                if node.state.game_over():
+            if node.node.state.game_over():
+                if node.node.state.game_over():
                     v_net = 0.0       # consistent normalized terminal value
                     self.ApplyVisitIncrements(path)
                     self.PropBack(v_net, node, path)
@@ -952,9 +998,9 @@ class MCTS:
         best_vis = -1
         best_avg = -1e9
 
-        for mv in root.priors.keys():
-            N = root.visit_count[mv]
-            avg = (root.value_sum[mv]/N) if N > 0 else 0.0
+        for mv in root.node.priors.keys():
+            N = root.node.visit_count[mv]
+            avg = (root.node.value_sum[mv]/N) if N > 0 else 0.0
 
             if N > best_vis or (N == best_vis and avg > best_avg):
                 best_vis = N
@@ -969,7 +1015,7 @@ class MCTS:
             self.batcher.flush()
             #for (evaluated_node, val, eval_path) in self.batcher.flush(): self.PropBack(val, evaluated_node, eval_path)
 
-        return best_mv, root
+        return best_mv, root.node
 
 # -------------------------
 # Self-play with heuristics + domino handling + MCTS
@@ -1286,16 +1332,19 @@ class PygameUI:
 
              for event in pygame.event.get():
                 if event.type==pygame.MOUSEBUTTONDOWN:
-                    if render: self.draw_board(t)
 
                     forced = heuristic_forced_move(t)
-                    if isinstance(forced, tuple): t.apply_move(forced); continue
+                    if isinstance(forced, tuple): 
+                        t.apply_move(forced)
+                        if render: self.draw_board(t)
+                        continue
 
                     mv, _ = self.trainer.mcts.search(t)
                     print(mv)
                     t.apply_move(mv)
 
-                    if render: pygame.time.wait(int(delay*1000))
+                    if render: self.draw_board(t)
+                    #if render: pygame.time.wait(int(delay*1000))
         print("AI vs AI finished. score:", t.score)
         if render: pygame.time.wait(2000)
 
@@ -1381,8 +1430,9 @@ def main():
     #debug
     #trainer.train_iterations(total_iters=args.iters, episodes_per_iter=4, prefill_start=0, prefill_end=args.board*args.board, batch_size=128)
 
-    ui = PygameUI(trainer, board_size=args.board, mcts_sim=args.mcts, heuristic_help=(args.guide==1))
-    ui.play_human_vs_ai()
+    #ui = PygameUI(trainer, board_size=args.board, mcts_sim=args.mcts, heuristic_help=(args.guide==1)) ; ui.play_human_vs_ai()
+
+    ui = PygameUI(trainer, board_size=args.board, mcts_sim=args.mcts) ;ui.play_ai_vs_ai(render=True)
 
     if args.mode == 'train':
         trainer.train_iterations(total_iters=args.iters, episodes_per_iter=4,
