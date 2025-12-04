@@ -45,17 +45,15 @@ class Table:
         self.remaining_boxes = N * N
 
         # Scores for players (Player1 / Player2). We keep separate counters.
-        self.scoreA = 0
-        self.scoreB = 0
+        #self.scoreA = 0
+        #self.scoreB = 0
+        self.score = 0 # Player1 score - Player 2 score
+
         # True => Player1 to move, False => Player2 to move
         self.FirstPlayer = True
 
         self.owner = None
         if (UI): self.owner = np.zeros((N, N), dtype=np.int8)
-
-    @property
-    def score(self):
-        return int(self.scoreA - self.scoreB)
 
     # ---------------------------
     # Box helpers
@@ -160,10 +158,8 @@ class Table:
 
         # Award points and update player turn
         if completed > 0:
-            if self.FirstPlayer:
-                self.scoreA += completed
-            else:
-                self.scoreB += completed
+            if self.FirstPlayer:    self.score += completed
+            else:                   self.score -= completed
             self.remaining_boxes -= completed
             # current player continues
         else:
@@ -176,8 +172,7 @@ class Table:
         t = Table(self.N)
         t.horizontal = self.horizontal.copy()
         t.vertical = self.vertical.copy()
-        t.scoreA = int(self.scoreA)
-        t.scoreB = int(self.scoreB)
+        t.score = int(self.score)
         t.remaining_boxes = int(self.remaining_boxes)
         t.FirstPlayer = bool(self.FirstPlayer)
         return t
@@ -710,7 +705,7 @@ class BatchEvaluator:
             return []
 
         # Encode all tables at once
-        arr = np.stack([encode_table(node.node.state) for (node, _) in self.pending], axis=0)
+        arr = np.stack([encode_table(node.state) for (node, _) in self.pending], axis=0)
         inp = torch.from_numpy(arr).to(self.device)
 
         with torch.no_grad():
@@ -737,7 +732,7 @@ import torch.nn as nn
 
 class MCTS_inner_Node:
     def __init__(self, state:Table):
-        self.state = state
+        self._state = state
         self.is_expanded = False
 
         # child move → node
@@ -768,6 +763,12 @@ class MCTSNode:
         self.FirstPlayer = table.FirstPlayer
         self.Score = table.score
         return self
+    
+    @property
+    def state(self):
+        self.node._state.FirstPlayer = self.FirstPlayer # to make functions work properly (like applymove)
+        self.node._state.score = self.Score
+        return self.node._state
 
 
 class MCTS:
@@ -793,17 +794,16 @@ class MCTS:
 
     def expand(self, node:MCTSNode):
 
-         # domino and forced filter for MCTS deeper moves
-        fm = heuristic_forced_move(node.node.state)
-        if isinstance(fm, dict) and 'domino' in fm:
-            moves = fm['domino']
+        # domino and forced filter for MCTS deeper moves
+        fm = heuristic_forced_move(node.state)
+        if isinstance(fm, dict) and 'domino' in fm: moves = fm['domino']
         elif isinstance(fm, tuple): moves = [fm]
-        else: moves, _, _ = generate_root_moves_with_collapse(node.node.state)
+        else: moves, _, _ = generate_root_moves_with_collapse(node.state)
 
         if not moves:
             node.node.is_expanded = True
             return
-        
+
         p = 1.0 / len(moves)
         for mv in moves:
             node.node.priors[mv] = p
@@ -870,17 +870,17 @@ class MCTS:
 
         # get Score_pred of nn for state from value ((Score_end-Score_node)/Boxes_left) - backwards
         full_game_score_pred = to_prop
-        full_game_score_pred *= leaf.node.state.remaining_boxes # total delta_score
+        full_game_score_pred *= leaf.state.remaining_boxes # total delta_score
         full_game_score_pred += leaf.Score # pred points
         
         for node, action in reversed(path):
             # node goes from        ] leaf ; root ]
             
             # root to lef points + pred points
-            if (node.node.state.remaining_boxes == 0): continue
+            if (node.state.remaining_boxes == 0): continue
 
             # to node player pov
-            nodePov = ((full_game_score_pred - node.Score) / node.node.state.remaining_boxes)
+            nodePov = ((full_game_score_pred - node.Score) / node.state.remaining_boxes)
             if (not node.FirstPlayer): nodePov = -nodePov
 
 
@@ -902,7 +902,7 @@ class MCTS:
         
         self.nodes.clear()
 
-        root = MCTSNode().from_table(root_state.clone())
+        root = MCTSNode().from_table(root_state.clone()) # certainly not forced
 
         # initial expansion + noise
         self.expand(root)
@@ -917,6 +917,7 @@ class MCTS:
             # SELECTION
             # -------------------------
             while node.node.is_expanded and node.node.priors:
+
                 mv = self.select_move(node)
                 if mv is None:
                     break
@@ -925,7 +926,7 @@ class MCTS:
 
                 # create child if missing
                 if mv not in node.node.children:
-                    child_state = node.node.state.clone()
+                    child_state = node.state.clone()
                     child_state.apply_move(mv)
 
 
@@ -962,6 +963,9 @@ class MCTS:
 
                 self.ApplyVisitIncrements(path)
                 self.expand(node)
+                if (len(node.node.priors) == 1): # if 1 possible move, make it.
+                    node.state.apply_move(mv)
+                    self.expand(node) # expand again (basically just recalculate the possible moves)
 
                 results = self.evaluate_leaf(node, path)
                 if results:
@@ -971,8 +975,8 @@ class MCTS:
 
                 continue # continue to next simulation because leaf evaluation happens asynchronously
 
-            if node.node.state.game_over():
-                if node.node.state.game_over():
+            if node.state.game_over():
+                if node.state.game_over():
                     v_net = 0.0       # consistent normalized terminal value
                     self.ApplyVisitIncrements(path)
                     self.PropBack(v_net, node, path)
@@ -1413,7 +1417,7 @@ class PygameUI:
 # -------------------------
 def main():
     parser = argparse.ArgumentParser()
-    #parser.add_argument('mode', choices=['play','train','selfplay','pvp'], help='Mode')
+    parser.add_argument('mode', choices=['play','train','selfplay','pvp'], help='Mode')
     parser.add_argument('--board', type=int, default=4)
     parser.add_argument('--guide', type=int, default=1) # help player with heuristics
     parser.add_argument('--device', default='cpu')
@@ -1432,7 +1436,7 @@ def main():
 
     #ui = PygameUI(trainer, board_size=args.board, mcts_sim=args.mcts, heuristic_help=(args.guide==1)) ; ui.play_human_vs_ai()
 
-    ui = PygameUI(trainer, board_size=args.board, mcts_sim=args.mcts) ;ui.play_ai_vs_ai(render=True)
+    #ui = PygameUI(trainer, board_size=args.board, mcts_sim=args.mcts) ;ui.play_ai_vs_ai(render=True)
 
     if args.mode == 'train':
         trainer.train_iterations(total_iters=args.iters, episodes_per_iter=4,
