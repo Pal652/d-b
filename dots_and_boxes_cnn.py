@@ -1037,66 +1037,79 @@ class Trainer:
                 pass
         print(f"Loaded model from {path}")
 
+    def warmup_replay(self, episodes=50, seed=0):
+        rng = random.Random(seed)
+        print("Warmup replay generation with weak MCTS...")
+
+        # temporary: very small MCTS simulations
+        old_sims = self.mcts.num_simulations
+        self.mcts.num_simulations = 8
+
+        for ep in range(episodes):
+            # large prefills to keep positions simple in warmup
+            prefills = 10
+
+            states, firsts, scores, mcts_vals, rems, final = \
+                self_play_episode(self.mcts, self.board_size, prefills, rng)
+
+            for s, fp, sc, vm, r in zip(states, firsts, scores, mcts_vals, rems):
+                target = 0.7*((final - sc)/r) + 0.3*vm
+                if not fp: target = -target
+                self.replay.push(s, target)
+
+        # restore simulation count
+        self.mcts.num_simulations = old_sims
+
     def train_iterations(self, total_iters=1000, episodes_per_iter=4,
-                         prefill_start=0, prefill_end=12, batch_size=128, seed=42, log_every=25):
-        rng = random.Random(seed); np.random.seed(seed); torch.manual_seed(seed)
-        # bootstrap replay
-        for _ in range(120):
-            t = Table(self.board_size, UI=False)
-            k = rng.randint(0,2)
-            for _ in range(k): # apply max 2 moves ?
-                moves = t.legal_moves()
-                if not moves: break
-                t.apply_move(rng.choice(moves))
-            
-            s_local=[] # pure edges of a random game state
-            w_local=[] # current players in the given states
-            while not t.game_over():
-                s_local.append(encode_table(t))
-                w_local.append(t.FirstPlayer)
-                t.apply_move(rng.choice(t.legal_moves()))
-            
-            final = t.score
-            maxs = t.max_score()
-            for s,w in zip(s_local,w_local): # target (needs rework)
-                target = (final/maxs) if w else (-final/maxs) # if this is the root, how much can he win (but bad, because of the premoves makes the first_player change)
-                self.replay.push(s,target) # DO NOT PUSH forced move states (also use heuristics druing randomplay!)
-        
-        print("Initial replay size:", len(self.replay))
+                         prefill_start=12, prefill_end=0,
+                         batch_size=128, seed=42, log_every=25):
+
+        rng = random.Random(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+
+        # 1) Warmup replay (weak MCTS)
+        self.warmup_replay(episodes=60, seed=seed)
+
+        # 2) Main training loop
         for it in range(1, total_iters+1):
-            frac = it/total_iters
-            prefills = int(prefill_start + frac*(prefill_end-prefill_start)) # prefill increments??? from start to end linearly
+            frac = it / total_iters
+            # PREFILL CSÖKKEN
+            prefills = int(prefill_start + (prefill_end - prefill_start) * frac)
+            self.mcts.num_simulations = int(20 + frac * 60)
+            for _ in range(episodes_per_iter):
+                states, firsts, scores, mcts_vals, rems, final = \
+                    self_play_episode(self.mcts, self.board_size, prefills, rng)
 
-            for _ in range(episodes_per_iter): # how many games to play before incresing??? prefil
-                root_encoded_states, root_was_first, root_scores, root_mcts_values, root_remaining_boxes, final_score = self_play_episode(self.mcts, self.board_size, prefills, rng)
+                # targets
+                for s, fp, sc, vm, r in zip(states, firsts, scores, mcts_vals, rems):
+                    target = 0.7 * ((final - sc) / r) + 0.3 * vm
+                    if not fp: target = -target
+                    self.replay.push(s, target)
 
-                # calc target (verified)
-                for state, wf, root_score, v_mcts, root_rem_box in zip(root_encoded_states, root_was_first, root_scores, root_mcts_values, root_remaining_boxes):
-                    target = ((final_score-root_score)/root_rem_box)*0.7 + v_mcts*0.3
-                    if not wf: target = -target
-                    self.replay.push(state,target)
-            
-            # train steps
-            if len(self.replay)>=8:
-                for _ in range(4): # 4 learning step
-                    st, tg = self.replay.sample(batch_size) # states, targets
-                    stt = torch.from_numpy(st).float().to(self.device) # transformed for model
-                    tgt = torch.from_numpy(tg).float().to(self.device) # transformed for model
+            # TRAINING STEPS
+            if len(self.replay) >= 64:
+                for _ in range(4):
+                    st, tg = self.replay.sample(batch_size)
+                    stt = torch.from_numpy(st).float().to(self.device)
+                    tgt = torch.from_numpy(tg).float().to(self.device)
+
                     self.model.train()
+                    pred = self.model(stt)
+                    loss = F.mse_loss(pred, tgt)
 
-                    preds = self.model(stt)
-                    loss = F.mse_loss(preds, tgt)
                     self.optimizer.zero_grad()
                     loss.backward()
                     self.optimizer.step()
 
-            if it%log_every==0 or it==1:
-                pass
-                print(f"Iter {it}/{total_iters} | replay={len(self.replay)} | prefills={prefills}")
-            if it%50==0:
+            if it % log_every == 0:
+                print(f"Iter {it}/{total_iters}  | replay={len(self.replay)}  | prefills={prefills}  | sims={self.mcts.num_simulations}")
+
+            if it % 100 == 0:
                 self.save(f"dots_value_checkpoint_it{it}.pt")
+
         self.save("dots_value_final.pt")
-        print("Training finished and saved.")
+        print("Training finished.")
 
 # -------------------------
 # Pygame UI updated for domino choices for human
