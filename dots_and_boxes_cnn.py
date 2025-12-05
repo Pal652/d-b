@@ -641,6 +641,8 @@ def is_sacrify_move(table: Table, move):
 # -------------------------
 # Value network (Option B: absolute Player1 perspective)
 # -------------------------
+
+"""
 class DotsValueNet(nn.Module):
     def __init__(self, board_size, channels=2):
         super().__init__()
@@ -659,6 +661,42 @@ class DotsValueNet(nn.Module):
         h = F.relu(self.fc1(h))
         v = torch.tanh(self.fc2(h))
         return v.squeeze(-1)
+"""
+
+class ResBlock(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.conv1 = nn.Conv2d(channels, channels, 3, padding=1)
+        self.conv2 = nn.Conv2d(channels, channels, 3, padding=1)
+        self.bn1 = nn.BatchNorm2d(channels)
+        self.bn2 = nn.BatchNorm2d(channels)
+
+    def forward(self, x):
+        h = F.relu(self.bn1(self.conv1(x)))
+        h = self.bn2(self.conv2(h))
+        return F.relu(h + x)
+
+
+class DotsValueNet(nn.Module):
+    def __init__(self, board_size, input_channels=2, channels=64, blocks=6):
+        super().__init__()
+        self.conv_in = nn.Conv2d(input_channels, channels, 3, padding=1)
+        self.bn_in = nn.BatchNorm2d(channels)
+
+        self.resblocks = nn.Sequential(*[
+            ResBlock(channels) for _ in range(blocks)
+        ])
+
+        self.pool = nn.AdaptiveAvgPool2d((1,1))
+        self.fc1 = nn.Linear(channels, 128)
+        self.fc2 = nn.Linear(128, 1)
+
+    def forward(self, x):
+        h = F.relu(self.bn_in(self.conv_in(x)))
+        h = self.resblocks(h)
+        h = self.pool(h).view(h.size(0), -1)
+        h = F.relu(self.fc1(h))
+        return torch.tanh(self.fc2(h)).squeeze(-1)
 
 # -------------------------
 # Replay buffer
@@ -1114,6 +1152,7 @@ class Trainer:
                 self_play_episode(self.mcts, self.board_size, prefills, rng)
 
             for s, fp, sc, vm, r in zip(states, firsts, scores, mcts_vals, rems):
+                if not fp: vm = -vm
                 target = 0.7*((final - sc)/r) + 0.3*vm
                 if not fp: target = -target
                 self.replay.push(s, target)
@@ -1144,6 +1183,7 @@ class Trainer:
 
                 # targets
                 for s, fp, sc, vm, r in zip(states, firsts, scores, mcts_vals, rems):
+                    if not fp: vm = -vm
                     target = 0.7 * ((final - sc) / r) + 0.3 * vm
                     if not fp: target = -target
                     self.replay.push(s, target)
@@ -1417,7 +1457,7 @@ class PygameUI:
 # -------------------------
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('mode', choices=['play','train','selfplay','pvp'], help='Mode')
+    #parser.add_argument('mode', choices=['play','train','selfplay','pvp'], help='Mode')
     parser.add_argument('--board', type=int, default=4)
     parser.add_argument('--guide', type=int, default=1) # help player with heuristics
     parser.add_argument('--device', default='cpu')
@@ -1432,7 +1472,7 @@ def main():
         #trainer.load('4x4_beta.pt')
 
     #debug
-    #trainer.train_iterations(total_iters=args.iters, episodes_per_iter=4, prefill_start=0, prefill_end=args.board*args.board, batch_size=128)
+    trainer.train_iterations(total_iters=args.iters, episodes_per_iter=4, prefill_start=0, prefill_end=args.board*args.board, batch_size=128)
 
     #ui = PygameUI(trainer, board_size=args.board, mcts_sim=args.mcts, heuristic_help=(args.guide==1)) ; ui.play_human_vs_ai()
 
