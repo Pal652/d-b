@@ -874,7 +874,7 @@ class MCTS:
     #"""
     def PropBack(self, to_prop, leaf: MCTSNode, path:List[Tuple[MCTSNode, Tuple[str,int,int]]]):
 
-        to_prop = 0 # debug test MCTS
+        #to_prop = 0 # debug test MCTS
 
         # in the tree every value is from the viewpoint of the NodePlayer,
         # and the Neural network gives the value from the viewpoint of the NodePlayer
@@ -1438,13 +1438,13 @@ class PygameUI:
 # -------------------------
 def main():
     parser = argparse.ArgumentParser()
-    #parser.add_argument('mode', choices=['play','train','selfplay','pvp'], help='Mode')
+    parser.add_argument('mode', choices=['play','train','selfplay','pvp'], help='Mode')
     parser.add_argument('--board', type=int, default=4)
     parser.add_argument('--guide', type=int, default=1) # help player with heuristics
     parser.add_argument('--device', default='cpu')
     parser.add_argument('--load', default=None)
-    parser.add_argument('--mcts', type=int, default=800)
-    parser.add_argument('--iters', type=int, default=300)
+    parser.add_argument('--mcts', type=int, default=80)
+    parser.add_argument('--iters', type=int, default=800)
     args = parser.parse_args()
 
     trainer = Trainer(board_size=args.board, mcts_num_sim=args.mcts, device=args.device)
@@ -1459,7 +1459,7 @@ def main():
 
     #ui = PygameUI(trainer, board_size=args.board, mcts_sim=args.mcts) ;ui.play_ai_vs_ai(render=True)
 
-    ui = PygameUI(trainer, board_size=args.board, mcts_sim=args.mcts, heuristic_help=(args.guide==1)) ; ui.play_human_vs_human()
+    #ui = PygameUI(trainer, board_size=args.board, mcts_sim=args.mcts, heuristic_help=(args.guide==1)) ; ui.play_human_vs_human()
 
     if args.mode == 'train':
         trainer.train_iterations(total_iters=args.iters, episodes_per_iter=4,
