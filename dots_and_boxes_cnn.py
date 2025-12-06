@@ -140,11 +140,11 @@ class Table:
         et = etype.lower()
         if et == 'h':
             if self.horizontal[y, x] == 1:
-                return 0
+                raise ValueError("horizontal edge already filled")
             self.horizontal[y, x] = 1
         elif et == 'v':
             if self.vertical[y, x] == 1:
-                return 0
+                raise ValueError("vertical edge already filled")
             self.vertical[y, x] = 1
         else:
             raise ValueError("move must start with 'h' or 'v'")
@@ -485,49 +485,17 @@ def generate_root_moves_with_collapse(state: Table):
 def domino_moves(table: Table, comp): # gives the devour and decline moves 
     """
     For the component, generate two candidate moves:
-    - devour: starter box's empty edge
-    - decline: any move in the component that does NOT immediately complete a box
+    - return the two moves that devour or decline the component (in random order)
     """
     seq = comp['sequence']
-    N = table.N
 
     # devour move: first box's empty edge
-    bx0, by0 = seq[0]
+    bx0, by0 = seq[1]
     empt0 = box_empty_edges(table, bx0, by0)
-    devour_move = box_edge_to_move(bx0, by0, empt0[0]) if empt0 else None
+    move1 = box_edge_to_move(bx0, by0, empt0[0])
+    move2 = box_edge_to_move(bx0, by0, empt0[1])
 
-    # candidate decline moves: any free edge in component excluding devour
-    candidates = set()
-    for (bx, by) in seq:
-        for e in box_empty_edges(table, bx, by):
-            mv = box_edge_to_move(bx, by, e)
-            if mv != devour_move:
-                candidates.add(mv)
-
-    decline_move = None
-    for mv in candidates:
-        t_clone = table.clone()
-        applied = t_clone.apply_move(mv)
-        if not applied:
-            continue
-        # Check if any box on board became 4-filled (completed)
-        completes = False
-        for y in range(N):
-            for x in range(N):
-                if box_filled_count(t_clone, x, y) == 4:
-                    completes = True
-                    break
-            if completes:
-                break
-        if not completes:
-            decline_move = mv
-            break
-
-    # fallback if none found
-    if decline_move is None and candidates:
-        decline_move = next(iter(candidates))
-
-    return devour_move, decline_move
+    return [move1, move2]
 
 
 # -------------------------
@@ -575,9 +543,9 @@ def heuristic_forced_move(table: Table):
                                      (c['type']=='loop' and len(c['sequence']) == 4)]
     if domino_comps:
         comp = domino_comps[0] # should be len 1 btw
-        dev, dec = domino_moves(table, comp)
+        d_moves = domino_moves(table, comp)
         #print("Devour:", dev, "Decline:", dec)
-        return {'domino': [dev, dec]}
+        return {'domino': d_moves}
 
     return None
 
@@ -773,9 +741,6 @@ class MCTS_inner_Node:
         self._state = state
         self.is_expanded = False
 
-        # child move → node
-        self.children: Dict[Tuple[str,int,int], "MCTSNode"] = {}
-
         # P, N, W for each move
         self.priors: Dict[Tuple[str,int,int], float] = {}
         self.visit_count: Dict[Tuple[str,int,int], int] = {}
@@ -790,6 +755,9 @@ class MCTSNode:
         self.FirstPlayer = None
         self.Score = None
 
+        # child move → node
+        self.children: Dict[Tuple[str,int,int], "MCTSNode"] = {}
+
     def from_node(self, node:MCTS_inner_Node, FirstPlayer, Score): # same state as an already checked one.
         self.node = node
         self.FirstPlayer = FirstPlayer
@@ -802,11 +770,19 @@ class MCTSNode:
         self.Score = table.score
         return self
     
+
+    # kills paralell running :(
     @property
     def state(self):
         self.node._state.FirstPlayer = self.FirstPlayer # to make functions work properly (like applymove)
         self.node._state.score = self.Score
         return self.node._state
+    
+    def apply_move_to_node(self, move): # only do, if you want to MOVE the node in the tree (for exaple making a forced move, and seting this node to its child)
+        self.state.apply_move(move)
+        self.FirstPlayer = self.node._state.FirstPlayer
+        self.Score = self.node._state.score
+        # CHANGES HASH
 
 
 class MCTS:
@@ -898,13 +874,13 @@ class MCTS:
     #"""
     def PropBack(self, to_prop, leaf: MCTSNode, path:List[Tuple[MCTSNode, Tuple[str,int,int]]]):
 
-        #to_prop = 0 # debug test MCTS
+        to_prop = 0 # debug test MCTS
 
         # in the tree every value is from the viewpoint of the NodePlayer,
-        # but the Neural network gives the value from the viewpoint of the NodePlayer
+        # and the Neural network gives the value from the viewpoint of the NodePlayer
 
         # back to FP pov (neural network deosent now who comes first, so it is node player pov)
-        if (not leaf.FirstPlayer): to_prop = -to_prop # to FP pov
+        if (not leaf.FirstPlayer): to_prop = -to_prop # to FP pov (for unwrapping to full_game_score_pred)
 
         # get Score_pred of nn for state from value ((Score_end-Score_node)/Boxes_left) - backwards
         full_game_score_pred = to_prop
@@ -917,7 +893,7 @@ class MCTS:
             # root to lef points + pred points
             if (node.state.remaining_boxes == 0): continue
 
-            # to node player pov
+            # wrap back, and convert to node player pov
             nodePov = ((full_game_score_pred - node.Score) / node.state.remaining_boxes)
             if (not node.FirstPlayer): nodePov = -nodePov
 
@@ -963,10 +939,23 @@ class MCTS:
                 path.append((node, mv))
 
                 # create child if missing
-                if mv not in node.node.children:
-                    child_state = node.state.clone()
+                if mv not in node.children:
+                    child_state = node.state.clone() # table
                     child_state.apply_move(mv)
 
+                    # forced move collapse
+                    fm = heuristic_forced_move(child_state)
+                    if isinstance(fm, dict) and 'domino' in fm: moves = fm['domino']
+                    elif isinstance(fm, tuple): moves = [fm]
+                    else: moves, _, _ = generate_root_moves_with_collapse(child_state)
+                    while (len(moves) == 1): # walk again and again (can be optimalised)
+                        child_state.apply_move(moves[0])
+                        fm = heuristic_forced_move(child_state)
+                        if isinstance(fm, dict) and 'domino' in fm: break
+                        elif isinstance(fm, tuple): moves = [fm]
+                        else: moves, _, _ = generate_root_moves_with_collapse(child_state)
+
+                    # no forced now
 
                     # setup decorated DAP structure (tree with repeated nodes)
                     hash_ = child_state.__hash__()
@@ -985,13 +974,13 @@ class MCTS:
 
                     
 
-                    node.node.children[mv] = child
+                    node.children[mv] = child
                     node = child
                         
                         
                     if (realNew): break
                 else:
-                    node = node.node.children[mv]
+                    node = node.children[mv]
 
             # -------------------------
             # EXPAND / EVALUATE OR TERMINAL
@@ -1001,9 +990,6 @@ class MCTS:
 
                 self.ApplyVisitIncrements(path)
                 self.expand(node)
-                if (len(node.node.priors) == 1): # if 1 possible move, make it.
-                    node.state.apply_move(mv)
-                    self.expand(node) # expand again (basically just recalculate the possible moves)
 
                 results = self.evaluate_leaf(node, path)
                 if results:
@@ -1014,24 +1000,19 @@ class MCTS:
                 continue # continue to next simulation because leaf evaluation happens asynchronously
 
             if node.state.game_over():
-                if node.state.game_over():
-                    v_net = 0.0       # consistent normalized terminal value
-                    self.ApplyVisitIncrements(path)
-                    self.PropBack(v_net, node, path)
-                    continue
+
+                v_net = 0.0       # consistent normalized terminal value
+                self.ApplyVisitIncrements(path)
+                self.PropBack(v_net, node, path)
+                continue
             else: # wut?
+                raise Exception("wut?")
                 # non-terminal leaf already expanded earlier (rare), queue for eval
                 results = self.evaluate_leaf(node, path)
                 if results:
                     for (evaluated_node, val, eval_path) in results:
                         self.PropBack(val, evaluated_node, eval_path)
                 continue
-
-            # Try to flush any remaining pending evaluations occasionally
-            ready = self.batcher.flush()
-            if ready:
-                for (evaluated_node, val, eval_path) in ready:
-                    self.PropBack(val, evaluated_node, eval_path)
 
         # ------------------------------------------
         # PICK BEST ROOT MOVE
@@ -1153,7 +1134,7 @@ class Trainer:
 
             for s, fp, sc, vm, r in zip(states, firsts, scores, mcts_vals, rems):
                 if not fp: vm = -vm
-                target = 0.7*((final - sc)/r) + 0.3*vm
+                target = 0.7*((final - sc)/r) #+ 0.3*vm # in warmup MCTS less relyable. (we will directly learn final scores)
                 if not fp: target = -target
                 self.replay.push(s, target)
 
@@ -1462,21 +1443,23 @@ def main():
     parser.add_argument('--guide', type=int, default=1) # help player with heuristics
     parser.add_argument('--device', default='cpu')
     parser.add_argument('--load', default=None)
-    parser.add_argument('--mcts', type=int, default=80)
-    parser.add_argument('--iters', type=int, default=800)
+    parser.add_argument('--mcts', type=int, default=800)
+    parser.add_argument('--iters', type=int, default=300)
     args = parser.parse_args()
 
     trainer = Trainer(board_size=args.board, mcts_num_sim=args.mcts, device=args.device)
     if args.load:
         trainer.load(args.load)
-        #trainer.load('4x4_beta.pt')
+        #trainer.load('dots_value_checkpoint_it200.pt')
 
     #debug
-    trainer.train_iterations(total_iters=args.iters, episodes_per_iter=4, prefill_start=0, prefill_end=args.board*args.board, batch_size=128)
+    #trainer.train_iterations(total_iters=args.iters, episodes_per_iter=4, prefill_start=0, prefill_end=args.board*args.board, batch_size=128)
 
     #ui = PygameUI(trainer, board_size=args.board, mcts_sim=args.mcts, heuristic_help=(args.guide==1)) ; ui.play_human_vs_ai()
 
     #ui = PygameUI(trainer, board_size=args.board, mcts_sim=args.mcts) ;ui.play_ai_vs_ai(render=True)
+
+    ui = PygameUI(trainer, board_size=args.board, mcts_sim=args.mcts, heuristic_help=(args.guide==1)) ; ui.play_human_vs_human()
 
     if args.mode == 'train':
         trainer.train_iterations(total_iters=args.iters, episodes_per_iter=4,
