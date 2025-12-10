@@ -631,6 +631,187 @@ class DotsValueNet(nn.Module):
         return v.squeeze(-1)
 """
 
+# GNN
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from typing import List
+
+# -------------------------
+# Small GNN block (dynamic adjacency lists)
+# -------------------------
+class GNNBlock(nn.Module):
+    """
+    Simple message-passing block.
+    - h: [B, N, D]
+    - adj_list: list of length B, each element is a list-of-lists neighbors:
+          adj_list[b][i] -> python list of neighbor indices of node i in graph b
+    Aggregation: mean over neighbors (if no neighbors -> zero vector).
+    """
+    def __init__(self, dim):
+        super().__init__()
+        self.lin_self = nn.Linear(dim, dim, bias=True)
+        self.lin_nei  = nn.Linear(dim, dim, bias=True) # 4 for mean/max/min/med
+        self.bn = nn.BatchNorm1d(dim)
+
+    def forward(self, h: torch.Tensor, adj_list: List[List[List[int]]]):
+        B, N, D = h.shape
+        out = torch.zeros((B, N, D), device=h.device, dtype=h.dtype)
+
+        for b in range(B):
+            hb = h[b]  # [N, D]
+            neigh_feats = torch.zeros((N, D), device=h.device, dtype=h.dtype)
+
+            for i in range(N):
+                nbrs = adj_list[b][i]
+                if nbrs:
+                    nbr_h = hb[nbrs]  # [num_nbrs, D]
+
+                    mean = nbr_h.mean(dim=0)
+                    mx   = nbr_h.max(dim=0).values
+                    mn   = nbr_h.min(dim=0).values
+                    med  = nbr_h.median(dim=0).values
+
+                    # Combine D*4 → D by averaging
+                    neigh_feats[i] = (mean + mx + mn + med) / 4.0
+                else:
+                    neigh_feats[i] = torch.zeros(D, device=h.device)
+
+            combined = self.lin_self(hb) + self.lin_nei(neigh_feats)  # both N×D
+
+            combined_bn = self.bn(combined)   # BN on feature dimension
+
+            out[b] = F.relu(combined_bn)
+
+        return out  # [B, N, D]
+
+
+
+# -------------------------
+# Dynamic GNN value network
+# -------------------------
+class DotsValueNet_GNN_dynamic(nn.Module):
+    """
+    Dynamic GNN over boxes. Input to forward_from_tables is a list of Table objects
+    (length B). Returns tensor [B] of scalar values in [-1,1].
+    """
+    def __init__(self, board_size:int, hidden_dim:int=64, blocks:int=4):
+        super().__init__()
+        self.board_size = board_size
+        self.num_boxes = (board_size - 1) * (board_size - 1)
+        self.hidden_dim = hidden_dim
+
+        # input projection from node raw feature -> hidden_dim
+        self.in_proj = nn.Linear(1, hidden_dim)   # node feature is single scalar (filled_count normalized)
+
+        # gnn body
+        self.blocks = nn.ModuleList([GNNBlock(hidden_dim) for _ in range(blocks)])
+
+        # readout head
+        self.fc1 = nn.Linear(hidden_dim, 128)
+        self.fc2 = nn.Linear(128, 1)
+
+    # -------------------------
+    # Helpers to convert Table -> node features and adjacency lists
+    # -------------------------
+    def tables_to_graphs(self, tables: List['Table']):
+        """
+        Convert a list of Table objects into:
+          - node_feats: tensor [B, num_boxes, 1] (filled_count / 4.0)
+          - adj_list: list length B, adj_list[b] is list of length num_boxes where each element is list of neighbor indices.
+        """
+        B = len(tables)
+        Nboxes = self.num_boxes
+        node_feats = torch.zeros((B, Nboxes, 1), dtype=torch.float32)
+        adj_list = [ [[] for _ in range(Nboxes)] for _ in range(B) ]
+
+        # helper to index box in row-major (r,c) -> idx
+        N = self.board_size - 1
+        def idx(r,c): return r * N + c
+
+        for b, T in enumerate(tables):
+            # fill node features
+            for r in range(N):
+                for c in range(N):
+                    i = idx(r,c)
+                    filled = T.box_filled_count(c, r)  # careful with bx,by ordering in your Table class
+                    node_feats[b, i, 0] = float(filled) / 4.0 # only avg of edges first
+
+            # build adjacency list based on OPEN (missing) shared edges only
+            # right neighbor: shared vertical edge at (c+1, r) -> vertical[r, c+1] == 0 => open
+            for r in range(N):
+                for c in range(N):
+                    i = idx(r,c)
+                    # right neighbor
+                    if c+1 < N:
+                        # shared edge is vertical at x = c+1, y = r  in your Table layout
+                        if T.vertical[r, c+1] == 0:
+                            j = idx(r, c+1)
+                            adj_list[b][i].append(j)
+                        # if open and undirected, also append back (we do both sides below)
+                    # left neighbor
+                    if c-1 >= 0:
+                        if T.vertical[r, c] == 0:
+                            j = idx(r, c-1)
+                            adj_list[b][i].append(j)
+                    # bottom neighbor
+                    if r+1 < N:
+                        # shared horizontal edge is horizontal at y = r+1, x = c
+                        if T.horizontal[r+1, c] == 0:
+                            j = idx(r+1, c)
+                            adj_list[b][i].append(j)
+                    # top neighbor
+                    if r-1 >= 0:
+                        if T.horizontal[r, c] == 0:
+                            j = idx(r-1, c)
+                            adj_list[b][i].append(j)
+
+            # Note: above we appended neighbors from each node viewpoint; adjacency is directed in the sense
+            # we explicitly added both directions when the shared edge is open (checks above cover both sides).
+        return node_feats, adj_list
+
+    # -------------------------
+    # Forward that accepts List[Table]
+    # -------------------------
+    def forward_from_tables(self, tables: List['Table']):
+        """
+        tables: list of Table objects (length B)
+        returns: tensor [B] with scalar in [-1,1]
+        """
+        assert isinstance(tables, list) and len(tables) > 0
+        B = len(tables)
+        node_feats, adj_list = self.tables_to_graphs(tables)  # [B, Nboxes, 1] and adj_list
+
+        device = next(self.parameters()).device
+        h = node_feats.to(device)          # [B,N,1]
+        h = F.relu(self.in_proj(h))        # [B,N,D]
+
+        # GNN blocks
+        for blk in self.blocks:
+            h = blk(h, adj_list)           # [B,N,D]
+
+        # global pooling (mean)
+        hg = h.mean(dim=1)                 # [B,D]
+
+        out = F.relu(self.fc1(hg))
+        out = torch.tanh(self.fc2(out)).squeeze(-1)  # [B]
+        return out
+
+    # -------------------------
+    # option: keep an incompatible forward that points user to forward_from_tables
+    # -------------------------
+    def forward(self, x):
+        raise NotImplementedError("This GNN expects a list of Table objects: use forward_from_tables(tables).")
+
+
+
+# CNN
+
 class ResBlock(nn.Module):
     def __init__(self, channels):
         super().__init__()
@@ -670,16 +851,19 @@ class DotsValueNet(nn.Module):
 # Replay buffer
 # -------------------------
 class ReplayBuffer:
-    def __init__(self, capacity=50000):
+    def __init__(self, mode, capacity=50000):
         self.buf = deque(maxlen=capacity) # (encoded states, target values)
+        self.mode = mode
 
     def push(self, s: np.ndarray, target: float):
-        self.buf.append((s.astype(np.float32), float(target)))
+        if (self.mode == "cnn"): self.buf.append((s.astype(np.float32), float(target)))
+        else: self.buf.append((s, float(target)))
 
     def sample(self, n):
         n = min(n, len(self.buf))
         batch = random.sample(self.buf, n) # gives n game X, Y-s
-        states = np.stack([b[0] for b in batch], axis=0)
+        if (self.mode == "cnn"): states = np.stack([b[0] for b in batch], axis=0)
+        else: states = [b[0] for b in batch]  # keep Table objects
         targets = np.array([b[1] for b in batch], dtype=np.float32)
         return states, targets
 
@@ -691,7 +875,8 @@ class ReplayBuffer:
 # -------------------------
 
 class BatchEvaluator:
-    def __init__(self, model, device, batch_size=32):
+    def __init__(self, model, device, batch_size=32, mode="cnn"):
+        self.mode = mode
         self.model = model
         self.device = device
         self.batch_size = batch_size
@@ -711,11 +896,16 @@ class BatchEvaluator:
             return []
 
         # Encode all tables at once
-        arr = np.stack([encode_table(node.state) for (node, _) in self.pending], axis=0)
-        inp = torch.from_numpy(arr).to(self.device)
+        if (self.mode == "cnn"):
+            arr = np.stack([encode_table(node.state) for (node, _) in self.pending], axis=0)
+            inp = torch.from_numpy(arr).to(self.device)
 
         with torch.no_grad():
-            vals = self.model(inp).cpu().numpy()
+            if (self.mode == "cnn"):
+                vals = self.model(inp).cpu().numpy()
+            else:
+                tables_list = [node.state for (node, _) in self.pending]
+                vals = self.model.forward_from_tables(tables_list).cpu().numpy()
 
         self.pending # debub
 
@@ -786,18 +976,19 @@ class MCTSNode:
 
 
 class MCTS:
-    def __init__(self, model:nn.Module, device,
+    def __init__(self, model:nn.Module, mode:str, device,
                  num_simulations:int = 50, c_puct:float = 1.0,
                  dirichlet_alpha:float = 0.3, dir_noise_eps:float = 0.25):
 
         self.model = model
+        self.mode = mode
         self.device = device
         self.num_simulations = num_simulations
         self.c_puct = c_puct
         self.dirichlet_alpha = dirichlet_alpha
         self.dir_noise_eps = dir_noise_eps
 
-        self.batcher = BatchEvaluator(model, device, batch_size=1)#round(num_simulations*0.08))
+        self.batcher = BatchEvaluator(model, device, batch_size=1, mode=self.mode)#round(num_simulations*0.08))
 
         self.nodes: Dict[int, MCTS_inner_Node] = {} # table hash to MCTSNode
 
@@ -940,6 +1131,7 @@ class MCTS:
 
                 # create child if missing
                 if mv not in node.children:
+
                     child_state = node.state.clone() # table
                     child_state.apply_move(mv)
 
@@ -1043,7 +1235,7 @@ class MCTS:
 # -------------------------
 # Self-play with heuristics + domino handling + MCTS
 # -------------------------
-def self_play_episode(mcts:MCTS, N:int, prefills:int, rng:random.Random):
+def self_play_episode(mcts:MCTS, N:int, prefills:int, rng:random.Random, mode="cnn"):
     t = Table(N)
     # rng games first
     for _ in range(prefills):
@@ -1057,7 +1249,9 @@ def self_play_episode(mcts:MCTS, N:int, prefills:int, rng:random.Random):
     root_remaining_boxes = []
     root_mcts_values = []
     while not t.game_over():
-        root_encoded_states.append(encode_table(t))
+        if (mode == "cnn"): root_encoded_states.append(encode_table(t))
+        else: root_encoded_states.append(t.clone())
+
         root_was_first.append(t.FirstPlayer)
         root_scores.append(t.score)
         root_remaining_boxes.append(t.remaining_boxes)
@@ -1088,15 +1282,18 @@ def self_play_episode(mcts:MCTS, N:int, prefills:int, rng:random.Random):
 # Trainer (save/load)
 # -------------------------
 class Trainer:
-    def __init__(self, board_size=4, mcts_num_sim=80, device='cpu', lr=2e-4, replay_capacity=50000):
+    def __init__(self, board_size=4, mcts_num_sim=80, device='cpu', lr=2e-4, replay_capacity=50000, mode="cnn"):
         self.device = torch.device(device)
         self.board_size = board_size
-        self.model = DotsValueNet(board_size).to(self.device)
+        self.mode = mode
+        if mode == "cnn": self.model = DotsValueNet(board_size).to(self.device)
+        else: self.model = DotsValueNet_GNN_dynamic(board_size).to(self.device)
         self.optimizer = optim.Adam(self.model.parameters(), lr=lr)
-        self.replay = ReplayBuffer(replay_capacity)
+        self.replay = ReplayBuffer(self.mode, replay_capacity)
 
         self.mcts = MCTS(
             model=self.model,
+            mode=self.mode,
             device=self.device,
             num_simulations=mcts_num_sim,  # default, overridden during train_iterations
         )
@@ -1130,7 +1327,7 @@ class Trainer:
             prefills = 10
 
             states, firsts, scores, mcts_vals, rems, final = \
-                self_play_episode(self.mcts, self.board_size, prefills, rng)
+                self_play_episode(self.mcts, self.board_size, prefills, rng, self.mode)
 
             for s, fp, sc, vm, r in zip(states, firsts, scores, mcts_vals, rems):
                 if not fp: vm = -vm
@@ -1160,7 +1357,7 @@ class Trainer:
             self.mcts.num_simulations = int(20 + frac * 60)
             for _ in range(episodes_per_iter):
                 states, firsts, scores, mcts_vals, rems, final = \
-                    self_play_episode(self.mcts, self.board_size, prefills, rng)
+                    self_play_episode(self.mcts, self.board_size, prefills, rng, self.mode)
 
                 # targets
                 for s, fp, sc, vm, r in zip(states, firsts, scores, mcts_vals, rems):
@@ -1173,11 +1370,15 @@ class Trainer:
             if len(self.replay) >= 64:
                 for _ in range(4):
                     st, tg = self.replay.sample(batch_size)
-                    stt = torch.from_numpy(st).float().to(self.device)
+                    if self.mode == "cnn": stt = torch.from_numpy(st).float().to(self.device)
+                    else: stt = st
+
                     tgt = torch.from_numpy(tg).float().to(self.device)
 
                     self.model.train()
-                    pred = self.model(stt)
+                    if self.mode == "cnn": pred = self.model(stt)
+                    else: pred = self.model.forward_from_tables(stt)  # list of Table objects
+
                     loss = F.mse_loss(pred, tgt)
 
                     self.optimizer.zero_grad()
@@ -1300,7 +1501,7 @@ class PygameUI:
     def play_human_vs_ai(self):
         table = Table(self.board_size, UI=True)
         running = True
-        human_is_p1 = True
+        human_is_p1 = False
         clock = pygame.time.Clock()
         while running:
             # draw & event
@@ -1443,11 +1644,12 @@ def main():
     parser.add_argument('--guide', type=int, default=1) # help player with heuristics
     parser.add_argument('--device', default='cpu')
     parser.add_argument('--load', default=None)
-    parser.add_argument('--mcts', type=int, default=80)
+    parser.add_argument('--mcts', type=int, default=800)
     parser.add_argument('--iters', type=int, default=800)
+    parser.add_argument('--model', choices=['cnn', 'gnn'], help='Model', default='gnn')
     args = parser.parse_args()
 
-    trainer = Trainer(board_size=args.board, mcts_num_sim=args.mcts, device=args.device)
+    trainer = Trainer(board_size=args.board, mcts_num_sim=args.mcts, device=args.device, mode=args.model)
     if args.load:
         trainer.load(args.load)
         #trainer.load('dots_value_checkpoint_it200.pt')
