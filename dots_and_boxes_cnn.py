@@ -19,6 +19,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 
+import matplotlib.pyplot as plt
+
 import functools
 import hashlib
 
@@ -646,17 +648,10 @@ from typing import List
 # Small GNN block (dynamic adjacency lists)
 # -------------------------
 class GNNBlock(nn.Module):
-    """
-    Simple message-passing block.
-    - h: [B, N, D]
-    - adj_list: list of length B, each element is a list-of-lists neighbors:
-          adj_list[b][i] -> python list of neighbor indices of node i in graph b
-    Aggregation: mean over neighbors (if no neighbors -> zero vector).
-    """
     def __init__(self, dim):
         super().__init__()
-        self.lin_self = nn.Linear(dim, dim, bias=True)
-        self.lin_nei  = nn.Linear(dim, dim, bias=True) # 4 for mean/max/min/med
+        self.lin_self = nn.Linear(dim, dim)
+        self.lin_nei  = nn.Linear(dim*4, dim)  # <- D*4 now
         self.bn = nn.BatchNorm1d(dim)
 
     def forward(self, h: torch.Tensor, adj_list: List[List[List[int]]]):
@@ -665,30 +660,27 @@ class GNNBlock(nn.Module):
 
         for b in range(B):
             hb = h[b]  # [N, D]
-            neigh_feats = torch.zeros((N, D), device=h.device, dtype=h.dtype)
+            neigh_feats = torch.zeros((N, D*4), device=h.device, dtype=h.dtype)
 
             for i in range(N):
                 nbrs = adj_list[b][i]
                 if nbrs:
                     nbr_h = hb[nbrs]  # [num_nbrs, D]
-
                     mean = nbr_h.mean(dim=0)
                     mx   = nbr_h.max(dim=0).values
                     mn   = nbr_h.min(dim=0).values
                     med  = nbr_h.median(dim=0).values
-
-                    # Combine D*4 → D by averaging
-                    neigh_feats[i] = (mean + mx + mn + med) / 4.0
+                    neigh_feats[i] = torch.cat([mean, mx, mn, med], dim=0)
                 else:
-                    neigh_feats[i] = torch.zeros(D, device=h.device)
+                    neigh_feats[i] = torch.zeros(D*4, device=h.device, dtype=h.dtype)
 
-            combined = self.lin_self(hb) + self.lin_nei(neigh_feats)  # both N×D
-
-            combined_bn = self.bn(combined)   # BN on feature dimension
-
+            combined = self.lin_self(hb) + self.lin_nei(neigh_feats)
+            combined_flat = combined.view(N, -1)
+            combined_bn = self.bn(combined_flat)
             out[b] = F.relu(combined_bn)
 
-        return out  # [B, N, D]
+        return out
+
 
 
 
@@ -703,7 +695,7 @@ class DotsValueNet_GNN_dynamic(nn.Module):
     def __init__(self, board_size:int, hidden_dim:int=64, blocks:int=4):
         super().__init__()
         self.board_size = board_size
-        self.num_boxes = (board_size - 1) * (board_size - 1)
+        self.num_boxes = (board_size) * (board_size)
         self.hidden_dim = hidden_dim
 
         # input projection from node raw feature -> hidden_dim
@@ -731,7 +723,7 @@ class DotsValueNet_GNN_dynamic(nn.Module):
         adj_list = [ [[] for _ in range(Nboxes)] for _ in range(B) ]
 
         # helper to index box in row-major (r,c) -> idx
-        N = self.board_size - 1
+        N = self.board_size
         def idx(r,c): return r * N + c
 
         for b, T in enumerate(tables):
@@ -1395,6 +1387,77 @@ class Trainer:
         print("Training finished.")
 
 # -------------------------
+# XAI
+# -------------------------
+
+import numpy as np
+import torch
+import matplotlib.pyplot as plt
+
+def open_edges(table: Table):
+    edges = []
+    N = table.N
+
+    # horizontals
+    for y in range(N+1):
+        for x in range(N):
+            if table.horizontal[y, x] == 0:
+                edges.append(('h', x, y))
+
+    # verticals
+    for y in range(N):
+        for x in range(N+1):
+            if table.vertical[y, x] == 0:
+                edges.append(('v', x, y))
+
+    return edges
+
+
+def edge_occlusion_importance(model, table, device):
+    model.eval()
+    with torch.no_grad():
+        base = model.forward_from_tables([table])[0].item()
+
+    imp = {}
+    edges = open_edges(table)
+    for e in edges:
+        t2 = table.clone()
+        t2.apply_move(e)
+        with torch.no_grad():
+            v = model.forward_from_tables([t2])[0].item()
+        imp[e] = abs(base - v)
+
+    return imp
+
+
+def XAI(trainer:Trainer):
+    model = trainer.model
+    table = Table(trainer.board_size, UI=True)
+    drawer = PygameUI(trainer, trainer.board_size)
+    edge_imp = edge_occlusion_importance(model, table, "cpu")
+    drawer.draw_board(table, edge_values=edge_imp)
+    input("press enter")
+
+def value_to_heat_color(v, vmax):
+    """
+    Maps v in [0, vmax] to RGB heat color.
+    Low = dark gray, High = red.
+    """
+    if vmax <= 0:
+        return (60, 60, 60)
+
+    t = max(0.0, min(1.0, v / vmax))
+
+    # dark -> yellow -> red
+    r = int(60 + 195 * t)
+    g = int(60 + 140 * (1 - abs(t - 0.5) * 2))
+    b = int(60 * (1 - t))
+
+    return (r, g, b)
+
+
+
+# -------------------------
 # Pygame UI updated for domino choices for human
 # -------------------------
 
@@ -1417,7 +1480,7 @@ class PygameUI:
         pygame.display.set_caption("Dots & Boxes - AI")
         self.font = pygame.font.SysFont(None, 24)
 
-    def draw_board(self, table:Table, highlight_moves:List[Tuple[str,int,int]]=None):
+    def draw_board(self, table:Table, highlight_moves:List[Tuple[str,int,int]]=None, edge_values: dict = None):
         self.screen.fill((30,30,30))
         N = table.N
         cell = self.cell
@@ -1425,6 +1488,9 @@ class PygameUI:
         if highlight_moves is None: highlight_moves = []
         suicide_edges = getattr(self, "_suicide_edges", set())
         collapsed_edges = getattr(self, "_collapsed_edges", set())
+
+        if edge_values: vmax = max(edge_values.values(), default=1e-6)
+        else: vmax = None
 
         # draw filled boxes (color by owner)
         for by in range(N):
@@ -1459,7 +1525,11 @@ class PygameUI:
                     elif mv in collapsed_edges:
                         pygame.draw.line(self.screen, (255,140,0), (px,py),(px+cell,py),6)  # orange
                     else:
-                        pygame.draw.line(self.screen,(60,60,60),(px,py),(px+cell,py),4) # faint, clickable
+                        if edge_values and mv in edge_values:
+                            col = value_to_heat_color(edge_values[mv], vmax)
+                            pygame.draw.line(self.screen, col, (px,py), (px+cell,py), 6)
+                        else:
+                            pygame.draw.line(self.screen,(60,60,60),(px,py),(px+cell,py),4)
 
         # vertical lines
         for y in range(N):
@@ -1479,7 +1549,11 @@ class PygameUI:
                     elif mv in collapsed_edges:
                         pygame.draw.line(self.screen, (255,140,0),(px,py),(px,py+cell),6)
                     else:
-                        pygame.draw.line(self.screen,(60,60,60),(px,py),(px,py+cell),4)
+                        if edge_values and mv in edge_values:
+                            col = value_to_heat_color(edge_values[mv], vmax)
+                            pygame.draw.line(self.screen, col, (px,py), (px,py+cell), 6)
+                        else:
+                            pygame.draw.line(self.screen,(60,60,60),(px,py),(px,py+cell),4)
 
         # draw dots
         for y in range(N+1):
@@ -1639,7 +1713,7 @@ class PygameUI:
 # -------------------------
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('mode', choices=['play','train','selfplay','pvp'], help='Mode')
+    parser.add_argument('mode', choices=['play','train','selfplay','pvp', 'xai'], help='Mode')
     parser.add_argument('--board', type=int, default=4)
     parser.add_argument('--guide', type=int, default=1) # help player with heuristics
     parser.add_argument('--device', default='cpu')
@@ -1663,9 +1737,14 @@ def main():
 
     #ui = PygameUI(trainer, board_size=args.board, mcts_sim=args.mcts, heuristic_help=(args.guide==1)) ; ui.play_human_vs_human()
 
+    #XAI(trainer)
+
     if args.mode == 'train':
         trainer.train_iterations(total_iters=args.iters, episodes_per_iter=4,
                                  prefill_start=0, prefill_end=args.board*args.board, batch_size=128)
+        
+    if args.mode == 'xai':
+        XAI(trainer)
 
     if args.mode == 'play':
         ui = PygameUI(trainer, board_size=args.board, mcts_sim=args.mcts, heuristic_help=(args.guide==1))
